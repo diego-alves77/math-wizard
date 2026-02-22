@@ -10,10 +10,12 @@ from statistics import mean, median
 WINDOW = 10
 N_OPTIONS = 3  # fixed: 3 answer buttons
 
+GAME_TITLE = "Mago da Matemática"
+
 LEVELS = {
-    1: "Fatos Atômicos",
-    2: "Dois Passos",
-    3: "Multioperação",
+    1: "Conta Simples",
+    2: "Conta Dupla",
+    3: "Memória",
 }
 
 ATOMIC_MODES = {
@@ -24,6 +26,7 @@ ATOMIC_MODES = {
     "Divisão com resto (só quociente)": "div_quot",
     "Mista": "mixed",
 }
+ATOMIC_ORDER = list(ATOMIC_MODES.keys())  # progression order inside "Conta Simples"
 
 MULTIOP_MODES = {
     "Soma": "sum",
@@ -41,9 +44,7 @@ TARGETS_ATOMIC = {
     "Divisão com resto (só quociente)": {"intermediate_hi": 3.5},
     "Mista": {"intermediate_hi": 2.5},  # conservative proxy
 }
-
 TARGETS_TWO_STEPS = {"intermediate_hi": 4.0}
-
 TARGETS_MULTIOP = {
     3: {"intermediate_hi": 4.5},
     4: {"intermediate_hi": 6.0},
@@ -60,6 +61,7 @@ def init_state():
     ss.setdefault("started", False)
     ss.setdefault("current_problem", None)  # dict
     ss.setdefault("start_time", None)
+
     ss.setdefault("history", [])
     ss.setdefault("rolling_correct", deque(maxlen=WINDOW))
     ss.setdefault("rolling_scores", [])
@@ -67,7 +69,12 @@ def init_state():
     ss.setdefault("last_prompt", None)
     ss.setdefault("last_rt", None)
     ss.setdefault("q_id", 0)
-    ss.setdefault("level_choice", 1)  # selectbox key-controlled
+
+    # Widget-controlled keys (must be set via callbacks or before widgets are created)
+    ss.setdefault("level_choice", 1)
+    ss.setdefault("atomic_mode_choice", ATOMIC_ORDER[0])
+    ss.setdefault("multi_mode_choice", "Soma")
+    ss.setdefault("n_operands_choice", 3)
 
 
 init_state()
@@ -76,18 +83,54 @@ init_state()
 # =========================
 # NAVIGATION (callbacks)
 # =========================
-def goto_level(new_level: int):
+def _next_stage(level: int, atomic_mode: str):
+    """Progression path:
+    Conta Simples: Soma -> Subtração -> Multiplicação -> Divisão exata -> Divisão quociente -> Mista
+    then Conta Dupla, then Memória.
+    """
+    level = int(level)
+    if level == 1:
+        idx = ATOMIC_ORDER.index(atomic_mode)
+        if idx < len(ATOMIC_ORDER) - 1:
+            return 1, ATOMIC_ORDER[idx + 1]
+        return 2, None
+    if level == 2:
+        return 3, None
+    return 3, None
+
+
+def _prev_stage(level: int, atomic_mode: str):
+    level = int(level)
+    if level == 1:
+        idx = ATOMIC_ORDER.index(atomic_mode)
+        if idx > 0:
+            return 1, ATOMIC_ORDER[idx - 1]
+        return 1, ATOMIC_ORDER[0]
+    if level == 2:
+        return 1, ATOMIC_ORDER[-1]
+    return 2, None
+
+
+def goto_stage(level: int, atomic_mode: str, direction: str):
+    if direction == "next":
+        new_level, new_atomic = _next_stage(level, atomic_mode)
+    else:
+        new_level, new_atomic = _prev_stage(level, atomic_mode)
+
     st.session_state["level_choice"] = int(new_level)
+    if new_level == 1 and new_atomic is not None:
+        st.session_state["atomic_mode_choice"] = new_atomic
+
     st.session_state["current_problem"] = None
     st.session_state["q_id"] += 1
 
 
-def goto_prev(level: int):
-    goto_level(max(1, int(level) - 1))
+def goto_prev(level: int, atomic_mode: str):
+    goto_stage(level, atomic_mode, "prev")
 
 
-def goto_next(level: int):
-    goto_level(min(3, int(level) + 1))
+def goto_next(level: int, atomic_mode: str):
+    goto_stage(level, atomic_mode, "next")
 
 
 # =========================
@@ -181,6 +224,26 @@ def render_vertical_expression(nums, ops):
 
 
 # =========================
+# "MEMORY KB" METRIC
+# =========================
+def memory_kb_for_problem(prob: dict) -> float:
+    """
+    Approximate "how much is stored in the head" as bytes of operands + operators,
+    measured from the exact textual tokens (UTF-8 bytes), converted to kB.
+    Includes:
+      - all operands (digits)
+      - all operators used between operands
+    Excludes:
+      - decorative text like "(quociente)" and formatting.
+    """
+    nums = prob.get("nums", [])
+    ops = prob.get("ops", [])
+    tokens = [str(n) for n in nums] + [str(o) for o in ops]
+    total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
+    return total_bytes / 1024.0
+
+
+# =========================
 # PROBLEM GENERATORS
 # =========================
 def gen_atomic(mode_key: str):
@@ -197,6 +260,8 @@ def gen_atomic(mode_key: str):
             correct = a + b
             kind = "addsub"
             prompt_key = display
+            nums = [a, b]
+            ops = ["+"]
 
         elif chosen == "sub":
             a, b = random.randint(2, 99), random.randint(2, 99)
@@ -206,6 +271,8 @@ def gen_atomic(mode_key: str):
             correct = a - b
             kind = "addsub"
             prompt_key = display
+            nums = [a, b]
+            ops = ["−"]
 
         elif chosen == "mul":
             a, b = random.randint(2, 12), random.randint(2, 12)
@@ -213,6 +280,8 @@ def gen_atomic(mode_key: str):
             correct = a * b
             kind = "mul"
             prompt_key = display
+            nums = [a, b]
+            ops = ["×"]
 
         elif chosen == "div_exact":
             b = random.randint(2, 12)
@@ -222,16 +291,20 @@ def gen_atomic(mode_key: str):
             correct = q
             kind = "div_quot"
             prompt_key = display
+            nums = [a, b]
+            ops = ["÷"]
 
         elif chosen == "div_quot":
             b = random.randint(2, 12)
             q = random.randint(2, 20)
             r = random.randint(1, b - 1)
             a = b * q + r
-            display = f"{a} ÷ {b} (quociente)"
+            display = f"{a} ÷ {b}"
             correct = a // b
             kind = "div_quot"
-            prompt_key = display
+            prompt_key = f"{display}|q"  # unique key without showing "quociente"
+            nums = [a, b]
+            ops = ["÷"]
 
         else:
             a, b = random.randint(2, 99), random.randint(2, 99)
@@ -239,6 +312,8 @@ def gen_atomic(mode_key: str):
             correct = a + b
             kind = "generic"
             prompt_key = display
+            nums = [a, b]
+            ops = ["+"]
 
         if avoid_repeat(prompt_key):
             break
@@ -248,9 +323,10 @@ def gen_atomic(mode_key: str):
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": f"Fatos Atômicos — {mode_key}",
+        "tag": f"Conta Simples — {mode_key}",
         "kind": "inline",
-        "context": {"level": 1, "atomic_mode": mode_key},
+        "nums": nums,
+        "ops": ops,
     }
 
 
@@ -282,9 +358,10 @@ def gen_two_steps():
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": "Dois Passos — 3 operandos",
+        "tag": "Conta Dupla — 3 termos",
         "kind": "inline",
-        "context": {"level": 2},
+        "nums": [a, b, c],
+        "ops": [op1, op2],
     }
 
 
@@ -332,9 +409,10 @@ def gen_multiop(mode_key: str, n_operands: int):
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": f"Multioperação — {mode_key}",
+        "tag": f"Memória — {mode_key}",
         "kind": "vertical",
-        "context": {"level": 3, "multi_mode": mode_key, "n_operands": int(n_operands)},
+        "nums": nums,
+        "ops": ops,
     }
 
 
@@ -365,16 +443,12 @@ def targets_text_for_context(level, atomic_mode=None, n_operands=None):
         return "Meta de RT: Iniciante 4–6 s | Intermediário 3–4 s | Avançado < 3 s"
 
     # level == 3
-    t = TARGETS_MULTIOP.get(int(n_operands), {"intermediate_hi": 6.0})
-    # Provide the same bands the user asked earlier, but contextual.
-    # (We keep it readable and consistent with the rest of the UI.)
     if int(n_operands) == 3:
         return "Meta de RT: Iniciante 4–7 s | Intermediário 3–4,5 s | Avançado < 3 s"
     if int(n_operands) == 4:
         return "Meta de RT: Iniciante 6–9 s | Intermediário 4–6 s | Avançado < 4 s"
     if int(n_operands) == 5:
         return "Meta de RT: Iniciante 8–12 s | Intermediário 6–8 s | Avançado < 6 s"
-    # 6
     return "Meta de RT: Iniciante 10–15 s | Intermediário 8–10 s | Avançado < 7 s"
 
 
@@ -396,15 +470,22 @@ def recommend_progress(level, atomic_mode, n_operands):
     # pick intermediate threshold
     if level == 1:
         thr = TARGETS_ATOMIC.get(atomic_mode, {"intermediate_hi": 2.5})["intermediate_hi"]
-        context_name = f"Fatos Atômicos ({atomic_mode})"
+        ctx = f"Conta Simples ({atomic_mode})"
+        next_level, next_atomic = _next_stage(1, atomic_mode)
+        if next_level == 1:
+            next_label = f"próximo modo: **{next_atomic}** (Conta Simples)"
+        else:
+            next_label = "próximo nível: **Conta Dupla**"
     elif level == 2:
         thr = TARGETS_TWO_STEPS["intermediate_hi"]
-        context_name = "Dois Passos"
+        ctx = "Conta Dupla"
+        next_label = "próximo nível: **Memória**"
     else:
         thr = TARGETS_MULTIOP.get(int(n_operands), {"intermediate_hi": 6.0})["intermediate_hi"]
-        context_name = f"Multioperação ({n_operands})"
+        ctx = f"Memória ({n_operands})"
+        next_label = "você já está no último nível"
 
-    # Decision rule (simple and stable):
+    # Decision rule:
     # - accuracy >= 90%
     # - median RT <= intermediate threshold
     if acc_used < 90.0:
@@ -417,17 +498,24 @@ def recommend_progress(level, atomic_mode, n_operands):
         return (
             f"Recomendação: **treine mais aqui**.\n\n"
             f"Motivo: sua **RT mediana** está em **{rt_med:.2f}s**, acima da meta intermediária "
-            f"(≤ {thr:.2f}s) para **{context_name}**."
+            f"(≤ {thr:.2f}s) para **{ctx}**."
         ), False
 
+    if level < 3:
+        return (
+            f"Recomendação: **pode avançar**.\n\n"
+            f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** "
+            f"(meta intermediária: ≤ {thr:.2f}s). Agora siga para {next_label}."
+        ), True
+
     return (
-        f"Recomendação: **pode seguir para o próximo nível**.\n\n"
+        f"Recomendação: **ótimo — continue refinando**.\n\n"
         f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** "
         f"(meta intermediária: ≤ {thr:.2f}s)."
     ), True
 
 
-def show_reference_and_navigation(level, atomic_mode, n_operands):
+def show_reference_and_navigation(level, atomic_mode, n_operands, current_mem_kb):
     st.divider()
     st.subheader("Referência e Orientação")
 
@@ -445,27 +533,34 @@ def show_reference_and_navigation(level, atomic_mode, n_operands):
     st.write(targets_text_for_context(level, atomic_mode=atomic_mode, n_operands=n_operands))
     st.caption("Regra: velocidade só conta se a acurácia rolante estiver em **90% ou mais**.")
 
+    st.markdown("### Carga de Memória (kB)")
+    st.write(f"**{current_mem_kb:.4f} kB**")
+    st.caption("Estimativa: bytes UTF-8 dos **operandos + operadores** (não inclui texto decorativo), convertidos para kB (1 kB = 1024 bytes).")
+
     st.markdown("### Próximo passo")
     rec, _ = recommend_progress(level, atomic_mode, n_operands)
     st.info(rec)
 
+    # Navigation buttons follow the correct progression sequence (but the select menu still allows jumping anywhere)
     nav_left, nav_right = st.columns(2)
+
     with nav_left:
         st.button(
-            "⬅ Voltar nível anterior",
+            "⬅ Voltar",
             use_container_width=True,
-            disabled=(level <= 1),
+            disabled=(level == 1 and atomic_mode == ATOMIC_ORDER[0]),
             on_click=goto_prev,
-            args=(level,),
+            args=(level, atomic_mode),
             key=f"nav_prev_{st.session_state.q_id}",
         )
+
     with nav_right:
         st.button(
-            "Seguir para próximo nível ➡",
+            "Avançar ➡",
             use_container_width=True,
-            disabled=(level >= 3),
+            disabled=(level == 3),
             on_click=goto_next,
-            args=(level,),
+            args=(level, atomic_mode),
             key=f"nav_next_{st.session_state.q_id}",
         )
 
@@ -473,7 +568,7 @@ def show_reference_and_navigation(level, atomic_mode, n_operands):
 # =========================
 # UI
 # =========================
-st.title("Rapid Number Forge — PT (botões)")
+st.title(GAME_TITLE)
 
 level = st.selectbox(
     "Opção do jogo",
@@ -482,18 +577,23 @@ level = st.selectbox(
     format_func=lambda x: f"{x} — {LEVELS[x]}",
 )
 
-atomic_mode = "Soma"
-multi_mode = "Soma"
-n_operands = 3
+atomic_mode = st.session_state["atomic_mode_choice"]
+multi_mode = st.session_state["multi_mode_choice"]
+n_operands = st.session_state["n_operands_choice"]
 
 if level == 1:
-    atomic_mode = st.selectbox("Modo (Fatos Atômicos)", list(ATOMIC_MODES.keys()))
+    atomic_mode = st.selectbox(
+        "Modo (Conta Simples)",
+        ATOMIC_ORDER,
+        key="atomic_mode_choice",
+    )
+
 elif level == 3:
     c1, c2 = st.columns([2, 1])
     with c1:
-        multi_mode = st.selectbox("Tipo (Multioperação)", list(MULTIOP_MODES.keys()))
+        multi_mode = st.selectbox("Tipo (Memória)", list(MULTIOP_MODES.keys()), key="multi_mode_choice")
     with c2:
-        n_operands = st.selectbox("Operandos", [3, 4, 5, 6], index=0)
+        n_operands = st.selectbox("Operandos", [3, 4, 5, 6], key="n_operands_choice")
 
 st.divider()
 
@@ -518,6 +618,7 @@ with colA:
                 "last_prompt",
                 "last_rt",
                 "q_id",
+                "last_prompt",
             ]:
                 if k in st.session_state:
                     del st.session_state[k]
@@ -545,83 +646,4 @@ prob = st.session_state.current_problem
 display = prob["display"]
 correct = prob["correct"]
 options = prob["options"]
-tag = prob["tag"]
-kind = prob["kind"]
-
-st.caption(tag)
-
-# Display problem
-if kind == "vertical":
-    st.code(display)
-else:
-    st.subheader(display)
-
-# Answer buttons: 3 buttons in a single row (wraps naturally on small screens)
-btn_cols = st.columns(3)
-clicked_value = None
-for i, opt in enumerate(options):
-    with btn_cols[i]:
-        if st.button(str(opt), key=f"opt_{st.session_state.q_id}_{i}", use_container_width=True):
-            clicked_value = opt
-
-if clicked_value is not None:
-    rt = time.time() - st.session_state.start_time
-    st.session_state.last_rt = rt
-
-    is_correct = (clicked_value == correct)
-    st.session_state.history.append(
-        {
-            "tag": tag,
-            "conta": display if kind != "vertical" else "(multioperação)",
-            "entrada": clicked_value,
-            "correto": correct,
-            "rt_s": rt,
-            "erro": detect_error(clicked_value, correct),
-        }
-    )
-
-    st.session_state.rolling_correct.append(is_correct)
-    if len(st.session_state.rolling_correct) == WINDOW:
-        pct = 100.0 * sum(st.session_state.rolling_correct) / WINDOW
-        st.session_state.rolling_scores.append(pct)
-        st.session_state.best_rolling = max(st.session_state.best_rolling, pct)
-
-    st.session_state.current_problem = None
-    st.rerun()
-
-st.divider()
-
-# Stats
-total = len(st.session_state.history)
-correct_total = sum(1 for r in st.session_state.history if r["erro"] == "correto")
-acc_total = (100.0 * correct_total / total) if total else 0.0
-
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("Respostas", f"{total}")
-c2.metric("Acurácia total", f"{acc_total:.1f}%")
-c3.metric("Melhor rolante", f"{st.session_state.best_rolling:.1f}%")
-c4.metric("Último tempo", "—" if st.session_state.last_rt is None else f"{st.session_state.last_rt:.2f}s")
-
-if total:
-    rts = [r["rt_s"] for r in st.session_state.history]
-    st.caption(f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s")
-
-# Rolling chart
-if len(st.session_state.rolling_correct) < WINDOW:
-    st.info(f"Acurácia rolante aparece após {WINDOW} respostas.")
-else:
-    current_pct = st.session_state.rolling_scores[-1]
-    st.metric(f"Acurácia rolante (últimas {WINDOW})", f"{current_pct:.1f}%")
-    st.line_chart(st.session_state.rolling_scores)
-
-# History
-if total:
-    st.subheader("Histórico recente")
-    st.dataframe(st.session_state.history[-20:], use_container_width=True)
-
-# End-of-page contextual reference + guidance + navigation
-show_reference_and_navigation(
-    level=level,
-    atomic_mode=atomic_mode,
-    n_operands=n_operands,
-    )
+tag = p
