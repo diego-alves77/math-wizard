@@ -8,7 +8,7 @@ from statistics import mean, median
 # CONFIG
 # =========================
 WINDOW = 10
-N_OPTIONS = 3  # exactly 3 answer buttons
+N_OPTIONS = 3  # always exactly 3 answer buttons
 GAME_TITLE = "Mago da Matemática"
 
 LEVELS = {
@@ -17,7 +17,7 @@ LEVELS = {
     3: "Memória",
 }
 
-# Correct progression inside Conta Simples
+# Progression inside Conta Simples (must be completed in this order)
 ATOMIC_MODES = [
     "Soma",
     "Subtração",
@@ -43,7 +43,7 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
-# Targets (seconds): intermediate threshold for "advance"
+# Intermediate thresholds (seconds) to allow "advance" (with accuracy >= 90%)
 TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Soma": 2.0,
     "Subtração": 2.0,
@@ -61,7 +61,6 @@ TARGETS_MULTIOP_INTERMEDIATE_HI = {
     5: 8.0,
     6: 10.0,
 }
-
 
 # =========================
 # STATE
@@ -81,7 +80,7 @@ def init_state():
     ss.setdefault("last_rt", None)
     ss.setdefault("q_id", 0)
 
-    # Widget keys (must be updated via callbacks)
+    # widget keys
     ss.setdefault("level_choice", 1)
     ss.setdefault("atomic_mode_choice", ATOMIC_MODES[0])
     ss.setdefault("multi_mode_choice", "Soma")
@@ -89,7 +88,6 @@ def init_state():
 
 
 init_state()
-
 
 # =========================
 # NAVIGATION (callbacks)
@@ -204,7 +202,8 @@ def make_options(correct: int, kind: str = "generic", a=None, b=None):
 
     # choose exactly N_OPTIONS, always include correct
     opts = list(opts)
-    opts.remove(correct)
+    if correct in opts:
+        opts.remove(correct)
     random.shuffle(opts)
     selected = [correct] + opts[: N_OPTIONS - 1]
     random.shuffle(selected)
@@ -221,7 +220,7 @@ def avoid_repeat(prompt_key: str) -> bool:
 def render_vertical_expression(nums, ops):
     """
     One operand per line, aligned INCLUDING the first line.
-    First line gets a blank operator slot ("  ") so it aligns with "+ ", "− ", "× ".
+    First line gets a blank operator slot ("  ") so it aligns with "+ ", "− ", "× ", "÷ ".
     """
     width = max(len(str(n)) for n in nums)
     lines = [f"  {str(nums[0]).rjust(width)}"]
@@ -231,15 +230,10 @@ def render_vertical_expression(nums, ops):
     return "\n".join(lines)
 
 
-# =========================
-# "MEMORY kB" METRIC
-# =========================
 def memory_kb_for_problem(nums, ops) -> float:
     """
-    Estimate "how much is stored in the head" as bytes of tokens:
-      - all operands (digits)
-      - all operators between operands (includes the current operation)
-    encoded as UTF-8, converted to kB (1 kB = 1024 bytes).
+    "Carga de Memória": bytes UTF-8 dos operandos + operadores (inclui o operador do desafio),
+    convertidos para kB (1 kB = 1024 bytes).
     """
     tokens = [str(n) for n in nums] + [str(o) for o in ops]
     total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
@@ -330,7 +324,6 @@ def gen_atomic(mode_key: str):
         "kind": "inline",
         "nums": nums,
         "ops": ops,
-        "prompt_key": prompt_key,
     }
 
 
@@ -361,11 +354,10 @@ def gen_two_steps():
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": "Conta Dupla — 3 termos",
+        "tag": "Conta Dupla",
         "kind": "inline",
         "nums": [a, b, c],
         "ops": [op1, op2],
-        "prompt_key": display,
     }
 
 
@@ -417,7 +409,6 @@ def gen_multiop(mode_key: str, n_operands: int):
         "kind": "vertical",
         "nums": nums,
         "ops": ops,
-        "prompt_key": prompt_key,
     }
 
 
@@ -443,10 +434,8 @@ def targets_text_for_context(level, atomic_mode=None, n_operands=None):
         if atomic_mode == "Divisão com resto (só quociente)":
             return "Meta de RT: Iniciante 3,5–5,0 s | Intermediário 2,5–3,5 s | Fluência alta < 2,0 s"
         return "Modo misto: use as metas dos submodos como referência."
-
     if level == 2:
         return "Meta de RT: Iniciante 4–6 s | Intermediário 3–4 s | Avançado < 3 s"
-
     # level == 3
     if int(n_operands) == 3:
         return "Meta de RT: Iniciante 4–7 s | Intermediário 3–4,5 s | Avançado < 3 s"
@@ -483,7 +472,7 @@ def recommend_progress(level, atomic_mode, n_operands):
         next_label = "Memória"
     else:
         thr = TARGETS_MULTIOP_INTERMEDIATE_HI.get(int(n_operands), 6.0)
-        ctx = f"Memória ({n_operands} operandos)"
+        ctx = f"Memória ({n_operands})"
         next_label = None
 
     if acc_used < 90.0:
@@ -580,7 +569,7 @@ level = st.selectbox(
     format_func=lambda x: f"{x} — {LEVELS[x]}",
 )
 
-# Keep a valid atomic mode for the progression path, even if user is in level 2/3
+# Keep a valid atomic mode for progression, even if user is on level 2/3
 atomic_mode_for_path = st.session_state["atomic_mode_choice"]
 multi_mode = st.session_state["multi_mode_choice"]
 n_operands = st.session_state["n_operands_choice"]
@@ -618,6 +607,7 @@ with colA:
             st.rerun()
     else:
         if st.button("⏹️ Reiniciar", type="secondary"):
+            # reset gameplay state, keep widget keys as-is
             for k in [
                 "started",
                 "current_problem",
@@ -671,11 +661,17 @@ if kind == "vertical":
 else:
     st.subheader(display)
 
-# Answer buttons (3 columns)
+# Answer buttons: 3 buttons, 1 line (columns)
 btn_cols = st.columns(3)
 clicked_value = None
 for i, opt in enumerate(options):
     with btn_cols[i]:
         if st.button(
             str(opt),
-          
+            key=f"opt_{st.session_state.q_id}_{i}",
+            use_container_width=True,
+        ):
+            clicked_value = opt
+
+# Handle answer click
+if clicked_value is 
