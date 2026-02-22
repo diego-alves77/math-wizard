@@ -1,9 +1,10 @@
-import streamlit as st
-import streamlit.components.v1 as components
 import random
 import time
 from collections import deque, defaultdict
 from statistics import mean, median
+
+import streamlit as st
+import streamlit.components.v1 as components
 
 # =========================
 # CONFIG
@@ -12,11 +13,7 @@ WINDOW = 10
 N_OPTIONS = 3
 GAME_TITLE = "Mago da Matemática"
 
-LEVELS = {
-    1: "Conta Simples",
-    2: "Conta Dupla",
-    3: "Memória",
-}
+LEVELS = {1: "Conta Simples", 2: "Conta Dupla", 3: "Memória"}
 
 ATOMIC_MODES = [
     "Soma",
@@ -45,7 +42,6 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
-# Progression thresholds (seconds) to allow "advance" if accuracy >= 90%
 TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Soma": 2.0,
     "Subtração": 2.0,
@@ -58,14 +54,20 @@ TARGETS_ATOMIC_INTERMEDIATE_HI = {
 TARGET_TWO_STEPS_INTERMEDIATE_HI = 4.0
 TARGETS_MULTIOP_INTERMEDIATE_HI = {3: 4.5, 4: 6.0, 5: 8.0, 6: 10.0}
 
-# Adaptive sampling: recent window per operation
+OPS_BASE = ["add", "sub", "mul", "div_exact", "div_quot"]
+OPS_BASELINE = {op: 1.0 for op in OPS_BASE}
+
 ADAPT_RECENT_N = 30
 ADAPT_ALPHA = 1.6
 ADAPT_MIN_BOOST = 0.85
 ADAPT_MAX_BOOST = 2.25
 
-OPS_BASE = ["add", "sub", "mul", "div_exact", "div_quot"]
-OPS_BASELINE = {op: 1.0 for op in OPS_BASE}
+GAME_DESC = (
+    "Treine cálculo mental com respostas por clique. O jogo mede sua **acurácia** e seu **RT** "
+    "(tempo de resposta) e recomenda se você deve **treinar mais** ou **avançar**. "
+    "Nos modos **Mista** e **Misto Desafiador**, ele aprende seus padrões e aumenta a frequência "
+    "dos tipos de conta em que você mais erra — voltando ao normal quando você melhora."
+)
 
 
 # =========================
@@ -88,13 +90,11 @@ def init_state():
 
     ss.setdefault("scroll_to_challenge", False)
 
-    # Widgets
     ss.setdefault("level_choice", 1)
     ss.setdefault("atomic_mode_choice", ATOMIC_MODES[0])
     ss.setdefault("multi_mode_choice", "Soma")
     ss.setdefault("n_operands_choice", 3)
 
-    # Adaptive profile
     ss.setdefault("profile", {})
     prof = ss["profile"]
     if "op_recent" not in prof:
@@ -110,8 +110,6 @@ init_state()
 
 # =========================
 # NAVIGATION
-# Progression: Conta Simples (each atomic mode) -> Conta Dupla -> Memória
-# Menu still allows jumping anywhere.
 # =========================
 def _next_stage(level: int, atomic_mode: str):
     level = int(level)
@@ -162,12 +160,13 @@ def goto_next(level: int, atomic_mode: str):
 
 
 # =========================
-# HELPERS
+# METRICS / HELPERS
 # =========================
 def rolling_accuracy_percent():
-    if len(st.session_state["rolling_correct"]) < WINDOW:
+    rc = st.session_state["rolling_correct"]
+    if len(rc) < WINDOW:
         return None
-    return 100.0 * sum(st.session_state["rolling_correct"]) / WINDOW
+    return 100.0 * sum(rc) / WINDOW
 
 
 def rt_mean_median():
@@ -262,20 +261,11 @@ def profile_record(op_code: str, is_correct: bool, error_label: str):
 
 
 def adaptive_op_weights():
-    """
-    For mixed modes: boost operations where recent accuracy is low.
-    Returns weights normalized to sum to 1.
-    If user improves, accuracy rises -> boost shrinks -> returns to baseline.
-    """
     prof = st.session_state["profile"]
     weights = {}
     for op in OPS_BASE:
         recent = prof["op_recent"][op]
-        if len(recent) == 0:
-            acc = 1.0  # no evidence -> no extra focus yet
-        else:
-            acc = sum(recent) / len(recent)
-
+        acc = 1.0 if len(recent) == 0 else (sum(recent) / len(recent))
         difficulty = max(0.0, 1.0 - acc)
         mult = 1.0 + ADAPT_ALPHA * difficulty
         mult = max(ADAPT_MIN_BOOST, min(ADAPT_MAX_BOOST, mult))
@@ -301,14 +291,9 @@ def weighted_choice(weights):
 # GENERATORS
 # =========================
 def gen_op_problem(op_code: str, hard: bool):
-    """
-    Returns (display, correct, kind, nums, ops, prompt_key, op_code, a, b)
-    """
     if op_code == "add":
-        if hard:
-            a, b = random.randint(-199, 199), random.randint(-199, 199)
-        else:
-            a, b = random.randint(2, 99), random.randint(2, 99)
+        a = random.randint(-199, 199) if hard else random.randint(2, 99)
+        b = random.randint(-199, 199) if hard else random.randint(2, 99)
         display = f"{a} + {b}"
         correct = a + b
         kind = "addsub"
@@ -316,9 +301,11 @@ def gen_op_problem(op_code: str, hard: bool):
 
     elif op_code == "sub":
         if hard:
-            a, b = random.randint(-199, 199), random.randint(-199, 199)
+            a = random.randint(-199, 199)
+            b = random.randint(-199, 199)
         else:
-            a, b = random.randint(2, 99), random.randint(2, 99)
+            a = random.randint(2, 99)
+            b = random.randint(2, 99)
             if b > a:
                 a, b = b, a
         display = f"{a} − {b}"
@@ -328,47 +315,38 @@ def gen_op_problem(op_code: str, hard: bool):
 
     elif op_code == "mul":
         if hard:
-            a, b = random.randint(7, 25), random.randint(7, 25)
+            a = random.randint(7, 25)
+            b = random.randint(7, 25)
             if random.random() < 0.25:
                 a = -a
             if random.random() < 0.25:
                 b = -b
         else:
-            a, b = random.randint(2, 12), random.randint(2, 12)
+            a = random.randint(2, 12)
+            b = random.randint(2, 12)
         display = f"{a} × {b}"
         correct = a * b
         kind = "mul"
         nums, ops = [a, b], ["×"]
 
     elif op_code == "div_exact":
-        if hard:
-            b = random.randint(2, 25)
-            q = random.randint(2, 25)
-            a = b * q
-            if random.random() < 0.20:
-                a = -a
-        else:
-            b = random.randint(2, 12)
-            q = random.randint(2, 12)
-            a = b * q
+        b = random.randint(2, 25) if hard else random.randint(2, 12)
+        q = random.randint(2, 25) if hard else random.randint(2, 12)
+        a = b * q
+        if hard and random.random() < 0.20:
+            a = -a
         display = f"{a} ÷ {b}"
         correct = int(a / b)
         kind = "div_quot"
         nums, ops = [a, b], ["÷"]
 
     else:  # div_quot
-        if hard:
-            b = random.randint(2, 25)
-            q = random.randint(2, 40)
-            r = random.randint(1, b - 1)
-            a = b * q + r
-            if random.random() < 0.20:
-                a = -a
-        else:
-            b = random.randint(2, 12)
-            q = random.randint(2, 20)
-            r = random.randint(1, b - 1)
-            a = b * q + r
+        b = random.randint(2, 25) if hard else random.randint(2, 12)
+        q = random.randint(2, 40) if hard else random.randint(2, 20)
+        r = random.randint(1, b - 1)
+        a = b * q + r
+        if hard and random.random() < 0.20:
+            a = -a
         display = f"{a} ÷ {b}"
         correct = a // b
         kind = "div_quot"
@@ -380,18 +358,13 @@ def gen_op_problem(op_code: str, hard: bool):
 
 def gen_atomic(mode_key: str):
     code = ATOMIC_MODE_TO_CODE[mode_key]
-
     while True:
         if code in ("mixed", "mixed_hard"):
             hard = (code == "mixed_hard")
-            weights = adaptive_op_weights()
-            op = weighted_choice(weights)
-            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op, hard=hard)
+            op = weighted_choice(adaptive_op_weights())
+            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op, hard)
         else:
-            hard = False
-            op_used = code
-            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op_used, hard=hard)
-
+            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(code, False)
         if avoid_repeat(prompt_key):
             break
 
@@ -426,7 +399,6 @@ def gen_two_steps():
         first = apply(a, op1, b)
         correct = apply(first, op2, c)
         display = f"({a} {op1} {b}) {op2} {c}"
-
         if avoid_repeat(display):
             break
 
@@ -445,7 +417,6 @@ def gen_two_steps():
 
 def gen_multiop(mode_key: str, n_operands: int):
     mode = MULTIOP_MODES[mode_key]
-
     while True:
         nums = [random.randint(2, 20) for _ in range(n_operands)]
 
@@ -464,9 +435,9 @@ def gen_multiop(mode_key: str, n_operands: int):
             ops = [random.choice(["+", "−"]) for _ in range(n_operands - 1)]
             correct = nums[0]
             for op, x in zip(ops, nums[1:]):
-                correct = correct + x if op == "+" else correct - x
+                correct = (correct + x) if (op == "+") else (correct - x)
             kind = "addsub"
-        else:  # mul
+        else:
             nums = [random.randint(2, 9) for _ in range(n_operands)]
             ops = ["×"] * (n_operands - 1)
             correct = 1
@@ -505,7 +476,7 @@ def generate_problem(level: int, atomic_mode: str, multi_mode: str, n_operands: 
 # =========================
 def targets_text_for_context(level, atomic_mode=None, n_operands=None):
     if level == 1:
-        if atomic_mode in ["Soma", "Subtração"]:
+        if atomic_mode in ("Soma", "Subtração"):
             return "Meta de RT: Iniciante 2,0–3,0 s | Intermediário 1,2–2,0 s | Fluência alta < 1,0 s"
         if atomic_mode == "Multiplicação":
             return "Meta de RT: Iniciante 2,5–4,0 s | Intermediário 1,5–2,5 s | Fluência alta < 1,2 s"
@@ -541,13 +512,13 @@ def recommend_progress(level, atomic_mode, n_operands):
 
     _, rt_med = rt_mean_median()
     if rt_med is None:
-        return "Sem dados de tempo suficientes para recomendar.", False
+        return "Sem dados suficientes para recomendar.", False
 
     if level == 1:
         thr = TARGETS_ATOMIC_INTERMEDIATE_HI.get(atomic_mode, 2.5)
         ctx = f"Conta Simples ({atomic_mode})"
         nxt_level, nxt_atomic = _next_stage(1, atomic_mode)
-        next_label = f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla"
+        next_label = (f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla")
     elif level == 2:
         thr = TARGET_TWO_STEPS_INTERMEDIATE_HI
         ctx = "Conta Dupla"
@@ -558,29 +529,22 @@ def recommend_progress(level, atomic_mode, n_operands):
         next_label = None
 
     if acc_used < 90.0:
-        return (
-            f"Recomendação: **treine mais aqui**.\n\n"
-            f"Motivo: sua {acc_label} está em **{acc_used:.1f}%** (meta: ≥ 90%)."
-        ), False
-
+        return f"Recomendação: **treine mais aqui**.\n\nMotivo: sua {acc_label} está em **{acc_used:.1f}%** (meta: ≥ 90%).", False
     if rt_med > thr:
         return (
             f"Recomendação: **treine mais aqui**.\n\n"
-            f"Motivo: sua **RT mediana** está em **{rt_med:.2f}s**, acima da meta intermediária "
-            f"(≤ {thr:.2f}s) para **{ctx}**."
+            f"Motivo: sua **RT mediana** está em **{rt_med:.2f}s**, acima da meta intermediária (≤ {thr:.2f}s) "
+            f"para **{ctx}**."
         ), False
-
     if next_label is None:
         return (
             f"Recomendação: **continue refinando**.\n\n"
-            f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** "
-            f"(meta intermediária: ≤ {thr:.2f}s)."
+            f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s)."
         ), True
-
     return (
         f"Recomendação: **pode avançar**.\n\n"
-        f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** "
-        f"(meta intermediária: ≤ {thr:.2f}s). Agora siga para **{next_label}**."
+        f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s). "
+        f"Agora siga para **{next_label}**."
     ), True
 
 
@@ -589,19 +553,17 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
     st.subheader("Referência e Orientação")
 
     st.markdown(
-        """
-**Siglas e termos (nesta página)**  
-- **RT** = *Tempo de Resposta* (tempo entre aparecer a conta e você clicar na resposta).  
-- **RT média** = média aritmética dos tempos (pode ser distorcida por respostas muito lentas).  
-- **RT mediana** = valor central dos tempos ordenados (representa melhor seu ritmo típico).  
-- **Acurácia rolante** = porcentagem de acertos nas **últimas 10** respostas.
-"""
+        "**Siglas e termos (nesta página)**\n"
+        "- **RT** = *Tempo de Resposta* (tempo entre aparecer a conta e você clicar na resposta).\n"
+        "- **RT média** = média aritmética dos tempos (pode ser distorcida por respostas muito lentas).\n"
+        "- **RT mediana** = valor central dos tempos ordenados (representa melhor seu ritmo típico).\n"
+        "- **Acurácia rolante** = porcentagem de acertos nas **últimas 10** respostas."
     )
 
     st.markdown("### Metas de RT (neste modo)")
-    if int(level) == 1:
+    if level == 1:
         st.write(targets_text_for_context(level, atomic_mode=atomic_mode_for_path))
-    elif int(level) == 2:
+    elif level == 2:
         st.write(targets_text_for_context(level))
     else:
         st.write(targets_text_for_context(level, n_operands=n_operands))
@@ -609,34 +571,29 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
 
     st.markdown("### Carga de Memória")
     st.write(f"**{current_mem_kb:.4f} kB**")
-    st.caption(
-        "Estimativa: bytes UTF-8 dos **operandos + operadores** (inclui o operador do desafio), "
-        "convertidos para kB (1 kB = 1024 bytes)."
-    )
+    st.caption("Estimativa: bytes UTF-8 dos **operandos + operadores**, convertidos para kB (1 kB = 1024 bytes).")
 
     st.markdown("### Próximo passo")
-    rec, _ = recommend_progress(int(level), atomic_mode_for_path, n_operands)
+    rec, _ = recommend_progress(level, atomic_mode_for_path, n_operands)
     st.info(rec)
 
     nav_left, nav_right = st.columns(2)
-
     with nav_left:
         st.button(
             "⬅ Voltar",
             use_container_width=True,
-            disabled=(int(level) == 1 and atomic_mode_for_path == ATOMIC_MODES[0]),
+            disabled=(level == 1 and atomic_mode_for_path == ATOMIC_MODES[0]),
             on_click=goto_prev,
-            args=(int(level), atomic_mode_for_path),
+            args=(level, atomic_mode_for_path),
             key=f"nav_prev_{st.session_state['q_id']}",
         )
-
     with nav_right:
         st.button(
             "Avançar ➡",
             use_container_width=True,
-            disabled=(int(level) == 3),
+            disabled=(level == 3),
             on_click=goto_next,
-            args=(int(level), atomic_mode_for_path),
+            args=(level, atomic_mode_for_path),
             key=f"nav_next_{st.session_state['q_id']}",
         )
 
@@ -646,8 +603,25 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
 # =========================
 st.title(GAME_TITLE)
 
-level = st.selectbox(
-    "Opção do jogo",
-    list(LEVELS.keys()),
-    key="level_choice",
-    format_func=lambd
+level = st.selectbox("Opção do jogo", list(LEVELS.keys()), key="level_choice", format_func=lambda x: f"{x} — {LEVELS[x]}")
+st.caption(GAME_DESC)
+
+atomic_mode_for_path = st.session_state["atomic_mode_choice"]
+multi_mode = st.session_state["multi_mode_choice"]
+n_operands = st.session_state["n_operands_choice"]
+
+if int(level) == 1:
+    atomic_mode_for_path = st.selectbox("Modo (Conta Simples)", ATOMIC_MODES, key="atomic_mode_choice")
+elif int(level) == 3:
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        multi_mode = st.selectbox("Tipo (Memória)", list(MULTIOP_MODES.keys()), key="multi_mode_choice")
+    with c2:
+        n_operands = st.selectbox("Operandos", [3, 4, 5, 6], key="n_operands_choice")
+
+st.divider()
+
+colA, colB = st.columns([1, 1])
+with colA:
+    if not st.session_state["started"]:
+     
