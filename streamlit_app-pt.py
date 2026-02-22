@@ -1,3 +1,4 @@
+
 import streamlit as st
 import random
 import time
@@ -674,4 +675,65 @@ for i, opt in enumerate(options):
             clicked_value = opt
 
 # Handle answer click
-if clicked_value is 
+if clicked_value is not None:
+    rt = time.time() - st.session_state.start_time
+    st.session_state.last_rt = rt
+
+    is_correct = (clicked_value == correct)
+
+    st.session_state.history.append(
+        {
+            "tag": tag,
+            "entrada": clicked_value,
+            "correto": correct,
+            "rt_s": rt,
+            "erro": detect_error(clicked_value, correct),
+        }
+    )
+
+    st.session_state.rolling_correct.append(is_correct)
+    if len(st.session_state.rolling_correct) == WINDOW:
+        pct = 100.0 * sum(st.session_state.rolling_correct) / WINDOW
+        st.session_state.rolling_scores.append(pct)
+        st.session_state.best_rolling = max(st.session_state.best_rolling, pct)
+
+    st.session_state.current_problem = None
+    st.rerun()
+
+st.divider()
+
+# Stats
+total = len(st.session_state.history)
+correct_total = sum(1 for r in st.session_state.history if r["erro"] == "correto")
+acc_total = (100.0 * correct_total / total) if total else 0.0
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Respostas", f"{total}")
+m2.metric("Acurácia total", f"{acc_total:.1f}%")
+m3.metric("Melhor rolante", f"{st.session_state.best_rolling:.1f}%")
+m4.metric("Último tempo", "—" if st.session_state.last_rt is None else f"{st.session_state.last_rt:.2f}s")
+
+if total:
+    rts = [r["rt_s"] for r in st.session_state.history]
+    st.caption(f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s")
+
+# Rolling chart
+if len(st.session_state.rolling_correct) < WINDOW:
+    st.info(f"Acurácia rolante aparece após {WINDOW} respostas.")
+else:
+    current_pct = st.session_state.rolling_scores[-1]
+    st.metric(f"Acurácia rolante (últimas {WINDOW})", f"{current_pct:.1f}%")
+    st.line_chart(st.session_state.rolling_scores)
+
+# History
+if total:
+    st.subheader("Histórico recente")
+    st.dataframe(st.session_state.history[-20:], use_container_width=True)
+
+# End-of-page reference + guidance + navigation + memory kB
+show_reference_and_navigation(
+    level=level,
+    atomic_mode_for_path=atomic_mode_for_path,
+    n_operands=n_operands,
+    current_mem_kb=current_mem_kb,
+)
