@@ -42,6 +42,7 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
+# thresholds (allow advance if rolling accuracy >= 90% AND rt_median <= threshold)
 TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Soma": 2.0,
     "Subtração": 2.0,
@@ -68,7 +69,6 @@ GAME_DESC = (
     "Nos modos **Mista** e **Misto Desafiador**, ele aprende seus padrões e aumenta a frequência "
     "dos tipos de conta em que você mais erra — voltando ao normal quando você melhora."
 )
-
 
 # =========================
 # STATE
@@ -107,9 +107,10 @@ def init_state():
 
 init_state()
 
-
 # =========================
 # NAVIGATION
+# progression: each Conta Simples mode -> Conta Dupla -> Memória
+# menu still lets user jump.
 # =========================
 def _next_stage(level: int, atomic_mode: str):
     level = int(level)
@@ -158,7 +159,6 @@ def goto_prev(level: int, atomic_mode: str):
 def goto_next(level: int, atomic_mode: str):
     goto_stage("next", level, atomic_mode)
 
-
 # =========================
 # METRICS / HELPERS
 # =========================
@@ -200,7 +200,6 @@ def avoid_repeat(prompt_key: str) -> bool:
 
 def make_options(correct: int, kind: str = "generic", a=None, b=None):
     opts = {correct}
-
     for d in (-1, 1, -2, 2, -10, 10):
         opts.add(correct + d)
 
@@ -248,7 +247,6 @@ def memory_kb_for_problem(nums, ops) -> float:
     total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
     return total_bytes / 1024.0
 
-
 # =========================
 # ADAPTIVE PROFILE
 # =========================
@@ -285,7 +283,6 @@ def weighted_choice(weights):
         if r <= s:
             return k
     return next(iter(weights.keys()))
-
 
 # =========================
 # GENERATORS
@@ -365,6 +362,7 @@ def gen_atomic(mode_key: str):
             display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op, hard)
         else:
             display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(code, False)
+
         if avoid_repeat(prompt_key):
             break
 
@@ -399,6 +397,7 @@ def gen_two_steps():
         first = apply(a, op1, b)
         correct = apply(first, op2, c)
         display = f"({a} {op1} {b}) {op2} {c}"
+
         if avoid_repeat(display):
             break
 
@@ -437,7 +436,7 @@ def gen_multiop(mode_key: str, n_operands: int):
             for op, x in zip(ops, nums[1:]):
                 correct = (correct + x) if (op == "+") else (correct - x)
             kind = "addsub"
-        else:
+        else:  # mul
             nums = [random.randint(2, 9) for _ in range(n_operands)]
             ops = ["×"] * (n_operands - 1)
             correct = 1
@@ -469,7 +468,6 @@ def generate_problem(level: int, atomic_mode: str, multi_mode: str, n_operands: 
     if level == 2:
         return gen_two_steps()
     return gen_multiop(multi_mode, n_operands)
-
 
 # =========================
 # GUIDANCE
@@ -518,7 +516,7 @@ def recommend_progress(level, atomic_mode, n_operands):
         thr = TARGETS_ATOMIC_INTERMEDIATE_HI.get(atomic_mode, 2.5)
         ctx = f"Conta Simples ({atomic_mode})"
         nxt_level, nxt_atomic = _next_stage(1, atomic_mode)
-        next_label = (f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla")
+        next_label = f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla"
     elif level == 2:
         thr = TARGET_TWO_STEPS_INTERMEDIATE_HI
         ctx = "Conta Dupla"
@@ -530,17 +528,20 @@ def recommend_progress(level, atomic_mode, n_operands):
 
     if acc_used < 90.0:
         return f"Recomendação: **treine mais aqui**.\n\nMotivo: sua {acc_label} está em **{acc_used:.1f}%** (meta: ≥ 90%).", False
+
     if rt_med > thr:
         return (
             f"Recomendação: **treine mais aqui**.\n\n"
             f"Motivo: sua **RT mediana** está em **{rt_med:.2f}s**, acima da meta intermediária (≤ {thr:.2f}s) "
             f"para **{ctx}**."
         ), False
+
     if next_label is None:
         return (
             f"Recomendação: **continue refinando**.\n\n"
             f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s)."
         ), True
+
     return (
         f"Recomendação: **pode avançar**.\n\n"
         f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s). "
@@ -571,7 +572,7 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
 
     st.markdown("### Carga de Memória")
     st.write(f"**{current_mem_kb:.4f} kB**")
-    st.caption("Estimativa: bytes UTF-8 dos **operandos + operadores**, convertidos para kB (1 kB = 1024 bytes).")
+    st.caption("Estimativa: bytes UTF-8 de **operandos + operadores**, convertidos para kB (1 kB = 1024 bytes).")
 
     st.markdown("### Próximo passo")
     rec, _ = recommend_progress(level, atomic_mode_for_path, n_operands)
@@ -597,13 +598,17 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
             key=f"nav_next_{st.session_state['q_id']}",
         )
 
-
 # =========================
 # UI
 # =========================
 st.title(GAME_TITLE)
 
-level = st.selectbox("Opção do jogo", list(LEVELS.keys()), key="level_choice", format_func=lambda x: f"{x} — {LEVELS[x]}")
+level = st.selectbox(
+    "Opção do jogo",
+    list(LEVELS.keys()),
+    key="level_choice",
+    format_func=lambda x: f"{x} — {LEVELS[x]}",
+)
 st.caption(GAME_DESC)
 
 atomic_mode_for_path = st.session_state["atomic_mode_choice"]
@@ -611,17 +616,207 @@ multi_mode = st.session_state["multi_mode_choice"]
 n_operands = st.session_state["n_operands_choice"]
 
 if int(level) == 1:
-    atomic_mode_for_path = st.selectbox("Modo (Conta Simples)", ATOMIC_MODES, key="atomic_mode_choice")
+    atomic_mode_for_path = st.selectbox(
+        "Modo (Conta Simples)",
+        ATOMIC_MODES,
+        key="atomic_mode_choice",
+    )
 elif int(level) == 3:
     c1, c2 = st.columns([2, 1])
     with c1:
-        multi_mode = st.selectbox("Tipo (Memória)", list(MULTIOP_MODES.keys()), key="multi_mode_choice")
+        multi_mode = st.selectbox(
+            "Tipo (Memória)",list(MULTIOP_MODES.keys()),
+            key="multi_mode_choice",
+        )
     with c2:
-        n_operands = st.selectbox("Operandos", [3, 4, 5, 6], key="n_operands_choice")
+        n_operands = st.selectbox(
+            "Operandos",
+            [3, 4, 5, 6],
+            key="n_operands_choice",
+        )
 
 st.divider()
 
 colA, colB = st.columns([1, 1])
+
 with colA:
     if not st.session_state["started"]:
-     
+        if st.button("▶️ Iniciar", type="primary"):
+            st.session_state["started"] = True
+            st.session_state["current_problem"] = None
+            st.session_state["q_id"] += 1
+            st.rerun()
+    else:
+        if st.button("⏹️ Reiniciar", type="secondary"):
+            for k in [
+                "started",
+                "current_problem",
+                "start_time",
+                "history",
+                "rolling_correct",
+                "rolling_scores",
+                "best_rolling",
+                "last_prompt_key",
+                "last_rt",
+                "q_id",
+                "scroll_to_challenge",
+                "profile",
+            ]:
+                if k in st.session_state:
+                    del st.session_state[k]
+            init_state()
+            st.rerun()
+
+with colB:
+    st.caption(f"Janela rolante: {WINDOW}")
+
+if not st.session_state["started"]:
+    st.stop()
+
+# =========================
+# GENERATE NEXT PROBLEM
+# =========================
+if st.session_state["current_problem"] is None:
+    st.session_state["current_problem"] = generate_problem(
+        int(level),
+        atomic_mode_for_path,
+        multi_mode,
+        int(n_operands),
+    )
+    st.session_state["start_time"] = time.time()
+    st.session_state["q_id"] += 1
+
+prob = st.session_state["current_problem"]
+display = prob["display"]
+correct = prob["correct"]
+options = prob["options"]
+tag = prob["tag"]
+kind = prob["kind"]
+nums = prob["nums"]
+ops = prob["ops"]
+op_code = prob.get("op_code", "unknown")
+
+current_mem_kb = memory_kb_for_problem(nums, ops)
+
+# =========================
+# SCROLL ANCHOR
+# =========================
+st.markdown('<div id="challenge"></div>', unsafe_allow_html=True)
+
+if st.session_state["scroll_to_challenge"]:
+    components.html(
+        "<script>"
+        "const el = window.parent.document.getElementById('challenge');"
+        "if (el) { el.scrollIntoView({behavior:'smooth', block:'center'}); }"
+        "</script>",
+        height=0,
+    )
+    st.session_state["scroll_to_challenge"] = False
+
+# =========================
+# CHALLENGE DISPLAY
+# =========================
+st.caption(tag)
+
+if kind == "vertical":
+    st.code(display)
+else:
+    st.subheader(display)
+
+# =========================
+# ANSWER BUTTONS
+# =========================
+btn_cols = st.columns(3)
+clicked_value = None
+
+for i, opt in enumerate(options):
+    with btn_cols[i]:
+        if st.button(
+            str(opt),
+            key=f"opt_{st.session_state['q_id']}_{i}",
+            use_container_width=True,
+        ):
+            clicked_value = opt
+
+# =========================
+# HANDLE ANSWER
+# =========================
+if clicked_value is not None:
+    rt = time.time() - st.session_state["start_time"]
+    st.session_state["last_rt"] = rt
+
+    is_correct = clicked_value == correct
+    err = detect_error(clicked_value, correct)
+    profile_record(op_code, is_correct, err)
+
+    st.session_state["history"].append(
+        {
+            "tag": tag,
+            "entrada": clicked_value,
+            "correto": correct,
+            "rt_s": rt,
+            "erro": err,
+            "op": op_code,
+        }
+    )
+
+    st.session_state["rolling_correct"].append(is_correct)
+
+    if len(st.session_state["rolling_correct"]) == WINDOW:
+        pct = 100.0 * sum(st.session_state["rolling_correct"]) / WINDOW
+        st.session_state["rolling_scores"].append(pct)
+        st.session_state["best_rolling"] = max(
+            st.session_state["best_rolling"], pct
+        )
+
+    st.session_state["current_problem"] = None
+    st.rerun()
+
+st.divider()
+
+# =========================
+# STATISTICS
+# =========================
+hist = st.session_state["history"]
+total = len(hist)
+correct_total = sum(1 for r in hist if r["erro"] == "correto")
+acc_total = (100.0 * correct_total / total) if total else 0.0
+
+m1, m2, m3, m4 = st.columns(4)
+m1.metric("Respostas", f"{total}")
+m2.metric("Acurácia total", f"{acc_total:.1f}%")
+m3.metric("Melhor rolante", f"{st.session_state['best_rolling']:.1f}%")
+m4.metric(
+    "Último tempo",
+    "—" if st.session_state["last_rt"] is None else f"{st.session_state['last_rt']:.2f}s",
+)
+
+if total:
+    rts = [r["rt_s"] for r in hist]
+    st.caption(
+        f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s"
+    )
+
+if len(st.session_state["rolling_correct"]) < WINDOW:
+    st.info(f"Acurácia rolante aparece após {WINDOW} respostas.")
+else:
+    current_pct = st.session_state["rolling_scores"][-1]
+    st.metric(
+        f"Acurácia rolante (últimas {WINDOW})",
+        f"{current_pct:.1f}%"
+    )
+    st.line_chart(st.session_state["rolling_scores"])
+
+if total:
+    st.subheader("Histórico recente")
+    st.dataframe(hist[-20:], use_container_width=True)
+
+# =========================
+# REFERENCE + NAVIGATION
+# =========================
+show_reference_and_navigation(
+    int(level),
+    atomic_mode_for_path,
+    int(n_operands),
+    current_mem_kb,
+)
