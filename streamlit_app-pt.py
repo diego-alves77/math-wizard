@@ -1,15 +1,15 @@
-
 import streamlit as st
+import streamlit.components.v1 as components
 import random
 import time
-from collections import deque
+from collections import deque, defaultdict
 from statistics import mean, median
 
 # =========================
 # CONFIG
 # =========================
 WINDOW = 10
-N_OPTIONS = 3  # always exactly 3 answer buttons
+N_OPTIONS = 3
 GAME_TITLE = "Mago da Matemática"
 
 LEVELS = {
@@ -26,6 +26,7 @@ ATOMIC_MODES = [
     "Divisão exata",
     "Divisão com resto (só quociente)",
     "Mista",
+    "Misto Desafiador",
 ]
 
 ATOMIC_MODE_TO_CODE = {
@@ -35,6 +36,7 @@ ATOMIC_MODE_TO_CODE = {
     "Divisão exata": "div_exact",
     "Divisão com resto (só quociente)": "div_quot",
     "Mista": "mixed",
+    "Misto Desafiador": "mixed_hard",
 }
 
 MULTIOP_MODES = {
@@ -44,7 +46,7 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
-# Intermediate thresholds (seconds) to allow "advance" (with accuracy >= 90%)
+# Intermediate thresholds (seconds): allow "advance" if accuracy >= 90% AND RT median <= threshold
 TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Soma": 2.0,
     "Subtração": 2.0,
@@ -52,16 +54,27 @@ TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Divisão exata": 3.0,
     "Divisão com resto (só quociente)": 3.5,
     "Mista": 2.5,
+    "Misto Desafiador": 3.2,
 }
-
 TARGET_TWO_STEPS_INTERMEDIATE_HI = 4.0
+TARGETS_MULTIOP_INTERMEDIATE_HI = {3: 4.5, 4: 6.0, 5: 8.0, 6: 10.0}
 
-TARGETS_MULTIOP_INTERMEDIATE_HI = {
-    3: 4.5,
-    4: 6.0,
-    5: 8.0,
-    6: 10.0,
+# Adaptive sampling config (only used in mixed modes)
+ADAPT_RECENT_N = 30
+ADAPT_ALPHA = 1.6           # strength of focusing weak ops
+ADAPT_MIN_BOOST = 0.85      # lower bound multiplier
+ADAPT_MAX_BOOST = 2.25      # upper bound multiplier
+ADAPT_DECAY_TO_BASELINE = True
+
+BASELINE_OPS = ["add", "sub", "mul", "div_exact", "div_quot"]
+BASELINE_WEIGHTS = {
+    "add": 1.0,
+    "sub": 1.0,
+    "mul": 1.0,
+    "div_exact": 1.0,
+    "div_quot": 1.0,
 }
+
 
 # =========================
 # STATE
@@ -81,19 +94,27 @@ def init_state():
     ss.setdefault("last_rt", None)
     ss.setdefault("q_id", 0)
 
-    # widget keys
+    # scrolling flag (used when pressing Avançar)
+    ss.setdefault("scroll_to_challenge", False)
+
+    # widgets
     ss.setdefault("level_choice", 1)
     ss.setdefault("atomic_mode_choice", ATOMIC_MODES[0])
     ss.setdefault("multi_mode_choice", "Soma")
     ss.setdefault("n_operands_choice", 3)
 
+    # adaptive profile
+    ss.setdefault("profile", {})
+    ss.profile.setdefault("op_recent", {op: deque(maxlen=ADAPT_RECENT_N) for op in BASELINE_OPS})
+    ss.profile.setdefault("error_counts", defaultdict(int))
+    ss.profile.setdefault("op_error_counts", {op: defaultdict(int) for op in BASELINE_OPS})
+
 
 init_state()
 
+
 # =========================
 # NAVIGATION (callbacks)
-# Progression: Conta Simples (each mode) -> Conta Dupla -> Memória
-# Menu still allows jumping anywhere.
 # =========================
 def _next_stage(level: int, atomic_mode: str):
     level = int(level)
@@ -122,8 +143,10 @@ def _prev_stage(level: int, atomic_mode: str):
 def goto_stage(direction: str, level: int, atomic_mode: str):
     if direction == "next":
         new_level, new_atomic = _next_stage(level, atomic_mode)
+        st.session_state.scroll_to_challenge = True  # scroll on "advance"
     else:
         new_level, new_atomic = _prev_stage(level, atomic_mode)
+        st.session_state.scroll_to_challenge = False
 
     st.session_state["level_choice"] = int(new_level)
     if int(new_level) == 1 and new_atomic is not None:
@@ -174,17 +197,14 @@ def detect_error(user, correct):
 def make_options(correct: int, kind: str = "generic", a=None, b=None):
     opts = {correct}
 
-    # near misses
     for d in (-1, 1, -2, 2, -10, 10):
         opts.add(correct + d)
 
-    # digit reversal
     s = str(abs(correct))
     if len(s) >= 2:
         rev = int(s[::-1])
         opts.add(rev if correct >= 0 else -rev)
 
-    # operation-specific distractors
     if kind == "mul" and a is not None and b is not None:
         opts.add(a + b)
         opts.add(a * (b + 1))
@@ -201,7 +221,6 @@ def make_options(correct: int, kind: str = "generic", a=None, b=None):
     while len(opts) < N_OPTIONS:
         opts.add(correct + random.randint(-spread, spread))
 
-    # choose exactly N_OPTIONS, always include correct
     opts = list(opts)
     if correct in opts:
         opts.remove(correct)
@@ -219,10 +238,6 @@ def avoid_repeat(prompt_key: str) -> bool:
 
 
 def render_vertical_expression(nums, ops):
-    """
-    One operand per line, aligned INCLUDING the first line.
-    First line gets a blank operator slot ("  ") so it aligns with "+ ", "− ", "× ", "÷ ".
-    """
     width = max(len(str(n)) for n in nums)
     lines = [f"  {str(nums[0]).rjust(width)}"]
     for op, n in zip(ops, nums[1:]):
@@ -232,86 +247,157 @@ def render_vertical_expression(nums, ops):
 
 
 def memory_kb_for_problem(nums, ops) -> float:
-    """
-    "Carga de Memória": bytes UTF-8 dos operandos + operadores (inclui o operador do desafio),
-    convertidos para kB (1 kB = 1024 bytes).
-    """
     tokens = [str(n) for n in nums] + [str(o) for o in ops]
     total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
     return total_bytes / 1024.0
 
 
 # =========================
+# ADAPTIVE PROFILE
+# =========================
+def profile_record(op_code: str, is_correct: bool, error_label: str):
+    if op_code not in BASELINE_OPS:
+        return
+    st.session_state.profile["op_recent"][op_code].append(1 if is_correct else 0)
+    st.session_state.profile["error_counts"][error_label] += 1
+    st.session_state.profile["op_error_counts"][op_code][error_label] += 1
+
+
+def adaptive_op_weights():
+    """
+    Returns normalized weights for choosing operations in mixed modes.
+    Focus more on operations with lower recent accuracy.
+    Reverts to baseline automatically when the user improves (because difficulty shrinks).
+    """
+    w = {}
+    for op in BASELINE_OPS:
+        recent = st.session_state.profile["op_recent"][op]
+        if len(recent) == 0:
+            acc = 1.0  # unknown -> treat as good (no extra focus yet)
+        else:
+            acc = sum(recent) / len(recent)
+
+        difficulty = max(0.0, 1.0 - acc)  # 0..1
+        mult = 1.0 + ADAPT_ALPHA * difficulty
+
+        # clamp
+        mult = max(ADAPT_MIN_BOOST, min(ADAPT_MAX_BOOST, mult))
+        w[op] = BASELINE_WEIGHTS[op] * mult
+
+    total = sum(w.values())
+    if total <= 0:
+        return {op: 1.0 / len(BASELINE_OPS) for op in BASELINE_OPS}
+    return {op: w[op] / total for op in BASELINE_OPS}
+
+
+def weighted_choice(weight_dict):
+    r = random.random()
+    s = 0.0
+    for k, w in weight_dict.items():
+        s += w
+        if r <= s:
+            return k
+    return next(iter(weight_dict.keys()))
+
+
+# =========================
 # PROBLEM GENERATORS
 # =========================
-def gen_atomic(mode_key: str):
-    mode = ATOMIC_MODE_TO_CODE[mode_key]
-
-    while True:
-        chosen = mode
-        if chosen == "mixed":
-            chosen = random.choice(["add", "sub", "mul", "div_exact", "div_quot"])
-
-        if chosen == "add":
+def gen_op_problem(op_code: str, hard: bool):
+    """
+    Generates a single atomic operation problem for a given op_code.
+    Returns: display, correct, kind, nums, ops, prompt_key, op_code
+    """
+    if op_code == "add":
+        if hard:
+            a, b = random.randint(-199, 199), random.randint(-199, 199)
+        else:
             a, b = random.randint(2, 99), random.randint(2, 99)
-            display = f"{a} + {b}"
-            correct = a + b
-            kind = "addsub"
-            prompt_key = display
-            nums = [a, b]
-            ops = ["+"]
+        display = f"{a} + {b}"
+        correct = a + b
+        kind = "addsub"
+        nums, ops = [a, b], ["+"]
 
-        elif chosen == "sub":
+    elif op_code == "sub":
+        if hard:
+            a, b = random.randint(-199, 199), random.randint(-199, 199)
+        else:
             a, b = random.randint(2, 99), random.randint(2, 99)
             if b > a:
                 a, b = b, a
-            display = f"{a} − {b}"
-            correct = a - b
-            kind = "addsub"
-            prompt_key = display
-            nums = [a, b]
-            ops = ["−"]
+        display = f"{a} − {b}"
+        correct = a - b
+        kind = "addsub"
+        nums, ops = [a, b], ["−"]
 
-        elif chosen == "mul":
+    elif op_code == "mul":
+        if hard:
+            a, b = random.randint(7, 25), random.randint(7, 25)
+            if random.random() < 0.25:
+                a = -a
+            if random.random() < 0.25:
+                b = -b
+        else:
             a, b = random.randint(2, 12), random.randint(2, 12)
-            display = f"{a} × {b}"
-            correct = a * b
-            kind = "mul"
-            prompt_key = display
-            nums = [a, b]
-            ops = ["×"]
+        display = f"{a} × {b}"
+        correct = a * b
+        kind = "mul"
+        nums, ops = [a, b], ["×"]
 
-        elif chosen == "div_exact":
+    elif op_code == "div_exact":
+        if hard:
+            b = random.randint(2, 25)
+            q = random.randint(2, 25)
+            a = b * q
+            if random.random() < 0.20:
+                a = -a
+        else:
             b = random.randint(2, 12)
             q = random.randint(2, 12)
             a = b * q
-            display = f"{a} ÷ {b}"
-            correct = q
-            kind = "div_quot"
-            prompt_key = display
-            nums = [a, b]
-            ops = ["÷"]
+        display = f"{a} ÷ {b}"
+        correct = int(a / b)
+        kind = "div_quot"
+        nums, ops = [a, b], ["÷"]
 
-        elif chosen == "div_quot":
+    else:  # div_quot
+        if hard:
+            b = random.randint(2, 25)
+            q = random.randint(2, 40)
+            r = random.randint(1, b - 1)
+            a = b * q + r
+            if random.random() < 0.20:
+                a = -a
+        else:
             b = random.randint(2, 12)
             q = random.randint(2, 20)
             r = random.randint(1, b - 1)
             a = b * q + r
-            display = f"{a} ÷ {b}"
-            correct = a // b
-            kind = "div_quot"
-            prompt_key = f"{display}|q"
-            nums = [a, b]
-            ops = ["÷"]
+        display = f"{a} ÷ {b}"
+        correct = a // b
+        kind = "div_quot"
+        nums, ops = [a, b], ["÷"]
 
+    prompt_key = f"{display}|{op_code}|{'H' if hard else 'N'}"
+    return display, correct, kind, nums, ops, prompt_key, op_code, a, b
+
+
+def gen_atomic(mode_key: str):
+    mode = ATOMIC_MODE_TO_CODE[mode_key]
+
+    while True:
+        if mode in ("mixed", "mixed_hard"):
+            hard = (mode == "mixed_hard")
+            weights = adaptive_op_weights()
+            op_code = weighted_choice(weights)
+            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op_code, hard=hard)
         else:
-            a, b = random.randint(2, 99), random.randint(2, 99)
-            display = f"{a} + {b}"
-            correct = a + b
-            kind = "generic"
-            prompt_key = display
-            nums = [a, b]
-            ops = ["+"]
+            hard = False
+            op_code = mode
+            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op_code, hard=hard)
+
+            # For "Divisão com resto (só quociente)" we must ensure it's quotient-only style.
+            # gen_op_problem already does that when op_code == "div_quot".
 
         if avoid_repeat(prompt_key):
             break
@@ -325,6 +411,7 @@ def gen_atomic(mode_key: str):
         "kind": "inline",
         "nums": nums,
         "ops": ops,
+        "op_code": op_used,
     }
 
 
@@ -359,6 +446,7 @@ def gen_two_steps():
         "kind": "inline",
         "nums": [a, b, c],
         "ops": [op1, op2],
+        "op_code": "two_steps",
     }
 
 
@@ -372,7 +460,6 @@ def gen_multiop(mode_key: str, n_operands: int):
             ops = ["+"] * (n_operands - 1)
             correct = sum(nums)
             kind = "addsub"
-
         elif mode == "sub":
             nums[0] = random.randint(30, 80)
             ops = ["−"] * (n_operands - 1)
@@ -380,14 +467,12 @@ def gen_multiop(mode_key: str, n_operands: int):
             for x in nums[1:]:
                 correct -= x
             kind = "addsub"
-
         elif mode == "sumsub":
             ops = [random.choice(["+", "−"]) for _ in range(n_operands - 1)]
             correct = nums[0]
             for op, x in zip(ops, nums[1:]):
                 correct = correct + x if op == "+" else correct - x
             kind = "addsub"
-
         else:  # mul
             nums = [random.randint(2, 9) for _ in range(n_operands)]
             ops = ["×"] * (n_operands - 1)
@@ -410,6 +495,7 @@ def gen_multiop(mode_key: str, n_operands: int):
         "kind": "vertical",
         "nums": nums,
         "ops": ops,
+        "op_code": f"mem_{mode}",
     }
 
 
@@ -434,10 +520,11 @@ def targets_text_for_context(level, atomic_mode=None, n_operands=None):
             return "Meta de RT: Iniciante 3,0–4,5 s | Intermediário 2,0–3,0 s | Fluência alta < 1,8 s"
         if atomic_mode == "Divisão com resto (só quociente)":
             return "Meta de RT: Iniciante 3,5–5,0 s | Intermediário 2,5–3,5 s | Fluência alta < 2,0 s"
+        if atomic_mode == "Misto Desafiador":
+            return "Meta de RT: Iniciante 3,0–5,0 s | Intermediário 2,2–3,2 s | Fluência alta < 2,0 s"
         return "Modo misto: use as metas dos submodos como referência."
     if level == 2:
         return "Meta de RT: Iniciante 4–6 s | Intermediário 3–4 s | Avançado < 3 s"
-    # level == 3
     if int(n_operands) == 3:
         return "Meta de RT: Iniciante 4–7 s | Intermediário 3–4,5 s | Avançado < 3 s"
     if int(n_operands) == 4:
@@ -544,196 +631,4 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
             use_container_width=True,
             disabled=(level == 1 and atomic_mode_for_path == ATOMIC_MODES[0]),
             on_click=goto_prev,
-            args=(level, atomic_mode_for_path),
-            key=f"nav_prev_{st.session_state.q_id}",
-        )
-    with nav_right:
-        st.button(
-            "Avançar ➡",
-            use_container_width=True,
-            disabled=(level == 3),
-            on_click=goto_next,
-            args=(level, atomic_mode_for_path),
-            key=f"nav_next_{st.session_state.q_id}",
-        )
-
-
-# =========================
-# UI
-# =========================
-st.title(GAME_TITLE)
-
-level = st.selectbox(
-    "Opção do jogo",
-    list(LEVELS.keys()),
-    key="level_choice",
-    format_func=lambda x: f"{x} — {LEVELS[x]}",
-)
-
-# Keep a valid atomic mode for progression, even if user is on level 2/3
-atomic_mode_for_path = st.session_state["atomic_mode_choice"]
-multi_mode = st.session_state["multi_mode_choice"]
-n_operands = st.session_state["n_operands_choice"]
-
-if level == 1:
-    atomic_mode_for_path = st.selectbox(
-        "Modo (Conta Simples)",
-        ATOMIC_MODES,
-        key="atomic_mode_choice",
-    )
-elif level == 3:
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        multi_mode = st.selectbox(
-            "Tipo (Memória)",
-            list(MULTIOP_MODES.keys()),
-            key="multi_mode_choice",
-        )
-    with c2:
-        n_operands = st.selectbox(
-            "Operandos",
-            [3, 4, 5, 6],
-            key="n_operands_choice",
-        )
-
-st.divider()
-
-colA, colB = st.columns([1, 1])
-with colA:
-    if not st.session_state.started:
-        if st.button("▶️ Iniciar", type="primary"):
-            st.session_state.started = True
-            st.session_state.current_problem = None
-            st.session_state.q_id += 1
-            st.rerun()
-    else:
-        if st.button("⏹️ Reiniciar", type="secondary"):
-            # reset gameplay state, keep widget keys as-is
-            for k in [
-                "started",
-                "current_problem",
-                "start_time",
-                "history",
-                "rolling_correct",
-                "rolling_scores",
-                "best_rolling",
-                "last_prompt_key",
-                "last_rt",
-                "q_id",
-            ]:
-                if k in st.session_state:
-                    del st.session_state[k]
-            init_state()
-            st.rerun()
-
-with colB:
-    st.caption(f"Janela rolante: {WINDOW}")
-
-if not st.session_state.started:
-    st.stop()
-
-# Create next problem
-if st.session_state.current_problem is None:
-    st.session_state.current_problem = generate_problem(
-        level=level,
-        atomic_mode=atomic_mode_for_path,
-        multi_mode=multi_mode,
-        n_operands=n_operands,
-    )
-    st.session_state.start_time = time.time()
-    st.session_state.q_id += 1
-
-prob = st.session_state.current_problem
-display = prob["display"]
-correct = prob["correct"]
-options = prob["options"]
-tag = prob["tag"]
-kind = prob["kind"]
-nums = prob["nums"]
-ops = prob["ops"]
-
-current_mem_kb = memory_kb_for_problem(nums, ops)
-
-st.caption(tag)
-
-# Display problem
-if kind == "vertical":
-    st.code(display)
-else:
-    st.subheader(display)
-
-# Answer buttons: 3 buttons, 1 line (columns)
-btn_cols = st.columns(3)
-clicked_value = None
-for i, opt in enumerate(options):
-    with btn_cols[i]:
-        if st.button(
-            str(opt),
-            key=f"opt_{st.session_state.q_id}_{i}",
-            use_container_width=True,
-        ):
-            clicked_value = opt
-
-# Handle answer click
-if clicked_value is not None:
-    rt = time.time() - st.session_state.start_time
-    st.session_state.last_rt = rt
-
-    is_correct = (clicked_value == correct)
-
-    st.session_state.history.append(
-        {
-            "tag": tag,
-            "entrada": clicked_value,
-            "correto": correct,
-            "rt_s": rt,
-            "erro": detect_error(clicked_value, correct),
-        }
-    )
-
-    st.session_state.rolling_correct.append(is_correct)
-    if len(st.session_state.rolling_correct) == WINDOW:
-        pct = 100.0 * sum(st.session_state.rolling_correct) / WINDOW
-        st.session_state.rolling_scores.append(pct)
-        st.session_state.best_rolling = max(st.session_state.best_rolling, pct)
-
-    st.session_state.current_problem = None
-    st.rerun()
-
-st.divider()
-
-# Stats
-total = len(st.session_state.history)
-correct_total = sum(1 for r in st.session_state.history if r["erro"] == "correto")
-acc_total = (100.0 * correct_total / total) if total else 0.0
-
-m1, m2, m3, m4 = st.columns(4)
-m1.metric("Respostas", f"{total}")
-m2.metric("Acurácia total", f"{acc_total:.1f}%")
-m3.metric("Melhor rolante", f"{st.session_state.best_rolling:.1f}%")
-m4.metric("Último tempo", "—" if st.session_state.last_rt is None else f"{st.session_state.last_rt:.2f}s")
-
-if total:
-    rts = [r["rt_s"] for r in st.session_state.history]
-    st.caption(f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s")
-
-# Rolling chart
-if len(st.session_state.rolling_correct) < WINDOW:
-    st.info(f"Acurácia rolante aparece após {WINDOW} respostas.")
-else:
-    current_pct = st.session_state.rolling_scores[-1]
-    st.metric(f"Acurácia rolante (últimas {WINDOW})", f"{current_pct:.1f}%")
-    st.line_chart(st.session_state.rolling_scores)
-
-# History
-if total:
-    st.subheader("Histórico recente")
-    st.dataframe(st.session_state.history[-20:], use_container_width=True)
-
-# End-of-page reference + guidance + navigation + memory kB
-show_reference_and_navigation(
-    level=level,
-    atomic_mode_for_path=atomic_mode_for_path,
-    n_operands=n_operands,
-    current_mem_kb=current_mem_kb,
-)
+            args=(level, atomic_mode_for_
