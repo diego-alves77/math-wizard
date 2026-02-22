@@ -2,26 +2,31 @@ import random
 import time
 from collections import deque, defaultdict
 from statistics import mean, median
+from pathlib import Path
+import json
+import hashlib
 
 import streamlit as st
 import streamlit.components.v1 as components
 
-# =========================
-# CONFIG
-# =========================
+# ============================================================
+# Mago da Matemática — Streamlit
+# ============================================================
+
 WINDOW = 10
 N_OPTIONS = 3
 GAME_TITLE = "Mago da Matemática"
 
 LEVELS = {1: "Conta Simples", 2: "Conta Dupla", 3: "Memória"}
 
+# UI labels (requested rename: Mista -> Misto)
 ATOMIC_MODES = [
     "Soma",
     "Subtração",
     "Multiplicação",
     "Divisão exata",
     "Divisão com resto (só quociente)",
-    "Mista",
+    "Misto",
     "Misto Desafiador",
 ]
 
@@ -31,7 +36,7 @@ ATOMIC_MODE_TO_CODE = {
     "Multiplicação": "mul",
     "Divisão exata": "div_exact",
     "Divisão com resto (só quociente)": "div_quot",
-    "Mista": "mixed",
+    "Misto": "mixed",
     "Misto Desafiador": "mixed_hard",
 }
 
@@ -42,37 +47,216 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
-# thresholds (allow advance if rolling accuracy >= 90% AND rt_median <= threshold)
-TARGETS_ATOMIC_INTERMEDIATE_HI = {
-    "Soma": 2.0,
-    "Subtração": 2.0,
-    "Multiplicação": 2.5,
-    "Divisão exata": 3.0,
-    "Divisão com resto (só quociente)": 3.5,
-    "Mista": 2.5,
-    "Misto Desafiador": 3.2,
-}
-TARGET_TWO_STEPS_INTERMEDIATE_HI = 4.0
-TARGETS_MULTIOP_INTERMEDIATE_HI = {3: 4.5, 4: 6.0, 5: 8.0, 6: 10.0}
+# ------------------------------------------------------------
+# Difficulty ladders (finite, human-oriented)
+# Each stage is Roman numeral I, II, III...
+# ------------------------------------------------------------
 
+# Soma stages: ranges for (a, b) non-negative
+SOMA_STAGES = [
+    (0, 1, 0, 1),     # I
+    (0, 3, 0, 1),     # II
+    (0, 3, 0, 3),     # III
+    (0, 7, 0, 3),     # IV
+    (0, 7, 0, 7),     # V
+    (0, 15, 0, 7),    # VI
+    (0, 15, 0, 15),   # VII
+    (0, 31, 0, 15),   # VIII
+    (0, 31, 0, 31),   # IX
+]
+
+# Subtração stages: keep result mostly non-negative early, allow negatives later
+SUB_STAGES = [
+    ("nonneg", 0, 5),     # I
+    ("nonneg", 0, 9),     # II
+    ("nonneg", 0, 15),    # III
+    ("nonneg", 0, 31),    # IV
+    ("mixed", -31, 31),   # V
+    ("mixed", -63, 63),   # VI
+]
+
+# Multiplicação stages: implement your requested progression
+# tuple: (small_max, big_max, both_big)
+MUL_STAGES = [
+    (5, 5, True),     # I  both 1..5
+    (7, 7, True),     # II
+    (9, 9, True),     # III
+    (12, 12, True),   # IV
+    (5, 15, False),   # V  one in 1..5, other in 1..15
+    (7, 15, False),   # VI
+    (9, 15, False),   # VII
+    (12, 15, False),  # VIII
+    (15, 15, True),   # IX both in 1..15
+]
+
+# Divisão exata: slow growth, start with bigger quotients
+DIV_EXACT_STAGES = [
+    (2, 3, 1, 5),     # I
+    (2, 4, 1, 6),     # II
+    (2, 5, 1, 7),     # III
+    (2, 6, 1, 8),     # IV
+    (2, 8, 1, 9),     # V
+    (2, 10, 1, 10),   # VI
+]
+
+# Divisão com resto (quociente): similar but allow remainder; start with larger quotients
+DIV_QUOT_STAGES = [
+    (2, 3, 1, 6),     # I
+    (2, 4, 1, 7),     # II
+    (2, 5, 1, 8),     # III
+    (2, 6, 1, 9),     # IV
+    (2, 8, 1, 10),    # V
+    (2, 10, 1, 12),   # VI
+]
+
+# Conta Dupla: (a range) and (b,c range) grow slowly (finite)
+TWO_STEPS_STAGES = [
+    (5, 30, 2, 9),     # I
+    (10, 50, 2, 12),   # II
+    (20, 80, 3, 15),   # III
+    (30, 99, 4, 20),   # IV
+]
+
+# Memória: stages increase operands and ranges
+# Each stage: (n_operands, value_min, value_max)
+MEMORY_STAGES = [
+    (3, 2, 9),     # I
+    (4, 2, 9),     # II
+    (5, 2, 9),     # III
+    (6, 2, 9),     # IV
+    (6, 2, 12),    # V
+    (6, 2, 15),    # VI
+]
+
+# ------------------------------------------------------------
+# Scoring: linear by game type, exponential by Roman stage
+# ------------------------------------------------------------
+MODE_BASE_POINTS = {
+    "Conta Simples": 10,
+    "Conta Dupla": 18,
+    "Memória": 25,
+}
+SCORE_GROWTH = 1.35
+
+# ------------------------------------------------------------
+# Adaptive profile for Misto / Misto Desafiador
+# ------------------------------------------------------------
 OPS_BASE = ["add", "sub", "mul", "div_exact", "div_quot"]
 OPS_BASELINE = {op: 1.0 for op in OPS_BASE}
-
 ADAPT_RECENT_N = 30
 ADAPT_ALPHA = 1.6
 ADAPT_MIN_BOOST = 0.85
 ADAPT_MAX_BOOST = 2.25
 
-GAME_DESC = (
-    "Treine cálculo mental com respostas por clique. O jogo mede sua **acurácia** e seu **RT** "
-    "(tempo de resposta) e recomenda se você deve **treinar mais** ou **avançar**. "
-    "Nos modos **Mista** e **Misto Desafiador**, ele aprende seus padrões e aumenta a frequência "
-    "dos tipos de conta em que você mais erra — voltando ao normal quando você melhora."
-)
+# ------------------------------------------------------------
+# Login (lightweight) - per-user persistence of score + stages
+# ------------------------------------------------------------
+USERS_DB = Path("users_db.json")
 
-# =========================
-# STATE
-# =========================
+def _load_users():
+    if USERS_DB.exists():
+        try:
+            return json.loads(USERS_DB.read_text(encoding="utf-8"))
+        except Exception:
+            return {}
+    return {}
+
+def _save_users(db):
+    USERS_DB.write_text(json.dumps(db, ensure_ascii=False, indent=2), encoding="utf-8")
+
+def _hash_pw(pw: str) -> str:
+    return hashlib.sha256(pw.encode("utf-8")).hexdigest()
+
+def login_gate():
+    st.session_state.setdefault("logged_in", False)
+    st.session_state.setdefault("user", None)
+
+    if st.session_state["logged_in"]:
+        return
+
+    st.title(GAME_TITLE)
+    st.subheader("Entrar")
+
+    db = _load_users()
+    known = sorted(db.keys())
+
+    choice = st.selectbox("Usuário (selecione ou crie um novo)", ["<novo usuário>"] + known)
+    if choice == "<novo usuário>":
+        username = st.text_input("Novo usuário")
+    else:
+        username = choice
+
+    password = st.text_input("Senha", type="password")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        if st.button("Entrar", type="primary"):
+            if not username or not password:
+                st.error("Preencha usuário e senha.")
+                st.stop()
+
+            if username in db:
+                if db[username].get("pw") == _hash_pw(password):
+                    st.session_state["logged_in"] = True
+                    st.session_state["user"] = username
+                    st.rerun()
+                else:
+                    st.error("Senha incorreta.")
+                    st.stop()
+            else:
+                db[username] = {
+                    "pw": _hash_pw(password),
+                    "score": 0,
+                    "stages": {},
+                }
+                _save_users(db)
+                st.session_state["logged_in"] = True
+                st.session_state["user"] = username
+                st.rerun()
+    with c2:
+        st.caption("Login simples (não é segurança bancária).")
+
+def persist_user_state():
+    u = st.session_state.get("user")
+    if not u:
+        return
+    db = _load_users()
+    if u not in db:
+        return
+    db[u]["score"] = int(st.session_state.get("score", 0))
+    db[u]["stages"] = dict(st.session_state.get("stages", {}))
+    _save_users(db)
+
+def load_user_state_into_session():
+    u = st.session_state.get("user")
+    if not u:
+        return
+    db = _load_users()
+    if u not in db:
+        return
+    st.session_state["score"] = int(db[u].get("score", 0))
+    st.session_state["stages"] = dict(db[u].get("stages", {}))
+
+# ------------------------------------------------------------
+# Roman numerals + formatting helpers
+# ------------------------------------------------------------
+ROMANS = ["I", "II", "III", "IV", "V", "VI", "VII", "VIII", "IX", "X", "XI", "XII"]
+
+def roman(n: int) -> str:
+    n = max(1, int(n))
+    if n <= len(ROMANS):
+        return ROMANS[n - 1]
+    return str(n)
+
+def fmt_addsub(a: int, b: int) -> str:
+    # Never show "a + -b"
+    if b < 0:
+        return f"{a} − {abs(b)}"
+    return f"{a} + {b}"
+
+# ------------------------------------------------------------
+# Session state
+# ------------------------------------------------------------
 def init_state():
     ss = st.session_state
     ss.setdefault("started", False)
@@ -95,6 +279,11 @@ def init_state():
     ss.setdefault("multi_mode_choice", "Soma")
     ss.setdefault("n_operands_choice", 3)
 
+    ss.setdefault("score", 0)
+
+    # stages stored in one dict so we can persist easily: key -> int stage
+    ss.setdefault("stages", {})
+
     ss.setdefault("profile", {})
     prof = ss["profile"]
     if "op_recent" not in prof:
@@ -104,78 +293,43 @@ def init_state():
     if "op_error_counts" not in prof:
         prof["op_error_counts"] = {op: defaultdict(int) for op in OPS_BASE}
 
-
 init_state()
 
-# =========================
-# NAVIGATION
-# progression: each Conta Simples mode -> Conta Dupla -> Memória
-# menu still lets user jump.
-# =========================
-def _next_stage(level: int, atomic_mode: str):
-    level = int(level)
+# ------------------------------------------------------------
+# Stage keys
+# ------------------------------------------------------------
+def stage_key_for(level: int, mode_label: str, submode_label: str | None = None) -> str:
     if level == 1:
-        idx = ATOMIC_MODES.index(atomic_mode)
-        if idx < len(ATOMIC_MODES) - 1:
-            return 1, ATOMIC_MODES[idx + 1]
-        return 2, None
+        # per atomic submode
+        return f"L1::{submode_label}"
     if level == 2:
-        return 3, None
-    return 3, None
+        return "L2::Conta Dupla"
+    return f"L3::{mode_label}"  # "Memória" here
 
+def get_stage(level: int, mode_label: str, submode_label: str | None = None) -> int:
+    k = stage_key_for(level, mode_label, submode_label)
+    st.session_state["stages"].setdefault(k, 1)
+    return int(st.session_state["stages"][k])
 
-def _prev_stage(level: int, atomic_mode: str):
-    level = int(level)
-    if level == 1:
-        idx = ATOMIC_MODES.index(atomic_mode)
-        if idx > 0:
-            return 1, ATOMIC_MODES[idx - 1]
-        return 1, ATOMIC_MODES[0]
-    if level == 2:
-        return 1, ATOMIC_MODES[-1]
-    return 2, None
+def set_stage(level: int, mode_label: str, stage: int, submode_label: str | None = None):
+    k = stage_key_for(level, mode_label, submode_label)
+    st.session_state["stages"][k] = int(max(1, stage))
 
-
-def goto_stage(direction: str, level: int, atomic_mode: str):
-    if direction == "next":
-        new_level, new_atomic = _next_stage(level, atomic_mode)
-        st.session_state["scroll_to_challenge"] = True
-    else:
-        new_level, new_atomic = _prev_stage(level, atomic_mode)
-        st.session_state["scroll_to_challenge"] = False
-
-    st.session_state["level_choice"] = int(new_level)
-    if int(new_level) == 1 and new_atomic is not None:
-        st.session_state["atomic_mode_choice"] = new_atomic
-
-    st.session_state["current_problem"] = None
-    st.session_state["q_id"] += 1
-
-
-def goto_prev(level: int, atomic_mode: str):
-    goto_stage("prev", level, atomic_mode)
-
-
-def goto_next(level: int, atomic_mode: str):
-    goto_stage("next", level, atomic_mode)
-
-# =========================
-# METRICS / HELPERS
-# =========================
+# ------------------------------------------------------------
+# Metrics / analysis
+# ------------------------------------------------------------
 def rolling_accuracy_percent():
     rc = st.session_state["rolling_correct"]
     if len(rc) < WINDOW:
         return None
     return 100.0 * sum(rc) / WINDOW
 
-
-def rt_mean_median():
+def rt_mean_median_recent(n=WINDOW):
     hist = st.session_state["history"]
     if not hist:
         return None, None
-    rts = [r["rt_s"] for r in hist]
+    rts = [r["rt_s"] for r in hist[-n:]]
     return mean(rts), median(rts)
-
 
 def detect_error(user, correct):
     if user is None:
@@ -190,14 +344,28 @@ def detect_error(user, correct):
         return "erro de sinal"
     return "erro de cálculo"
 
-
 def avoid_repeat(prompt_key: str) -> bool:
     if prompt_key == st.session_state["last_prompt_key"]:
         return False
     st.session_state["last_prompt_key"] = prompt_key
     return True
 
+def memory_kb_for_problem(nums, ops) -> float:
+    tokens = [str(n) for n in nums] + [str(o) for o in ops]
+    total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
+    return total_bytes / 1024.0
 
+def render_vertical_expression(nums, ops):
+    width = max(len(str(n)) for n in nums)
+    lines = [f"  {str(nums[0]).rjust(width)}"]
+    for op, n in zip(ops, nums[1:]):
+        lines.append(f"{op} {str(n).rjust(width)}")
+    lines.append("-" * (width + 2))
+    return "\n".join(lines)
+
+# ------------------------------------------------------------
+# Options (3 buttons)
+# ------------------------------------------------------------
 def make_options(correct: int, kind: str = "generic", a=None, b=None):
     opts = {correct}
     for d in (-1, 1, -2, 2, -10, 10):
@@ -232,31 +400,15 @@ def make_options(correct: int, kind: str = "generic", a=None, b=None):
     random.shuffle(selected)
     return selected
 
-
-def render_vertical_expression(nums, ops):
-    width = max(len(str(n)) for n in nums)
-    lines = [f"  {str(nums[0]).rjust(width)}"]
-    for op, n in zip(ops, nums[1:]):
-        lines.append(f"{op} {str(n).rjust(width)}")
-    lines.append("-" * (width + 2))
-    return "\n".join(lines)
-
-
-def memory_kb_for_problem(nums, ops) -> float:
-    tokens = [str(n) for n in nums] + [str(o) for o in ops]
-    total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
-    return total_bytes / 1024.0
-
-# =========================
-# ADAPTIVE PROFILE
-# =========================
+# ------------------------------------------------------------
+# Adaptive profile (Misto)
+# ------------------------------------------------------------
 def profile_record(op_code: str, is_correct: bool, error_label: str):
     prof = st.session_state["profile"]
     prof["error_counts"][error_label] += 1
     if op_code in OPS_BASE:
         prof["op_recent"][op_code].append(1 if is_correct else 0)
         prof["op_error_counts"][op_code][error_label] += 1
-
 
 def adaptive_op_weights():
     prof = st.session_state["profile"]
@@ -274,7 +426,6 @@ def adaptive_op_weights():
         return {op: 1.0 / len(OPS_BASE) for op in OPS_BASE}
     return {op: weights[op] / total for op in OPS_BASE}
 
-
 def weighted_choice(weights):
     r = random.random()
     s = 0.0
@@ -284,84 +435,180 @@ def weighted_choice(weights):
             return k
     return next(iter(weights.keys()))
 
-# =========================
-# GENERATORS
-# =========================
-def gen_op_problem(op_code: str, hard: bool):
-    if op_code == "add":
-        a = random.randint(-199, 199) if hard else random.randint(2, 99)
-        b = random.randint(-199, 199) if hard else random.randint(2, 99)
-        display = f"{a} + {b}"
-        correct = a + b
-        kind = "addsub"
-        nums, ops = [a, b], ["+"]
-
-    elif op_code == "sub":
-        if hard:
-            a = random.randint(-199, 199)
-            b = random.randint(-199, 199)
+# ------------------------------------------------------------
+# Targets and auto-progression
+# ------------------------------------------------------------
+def target_rt_for(level: int, submode: str, stage_idx: int, n_operands: int | None = None) -> float:
+    """
+    Higher stage => slightly higher acceptable RT (because difficulty increases).
+    """
+    stage_idx = max(1, int(stage_idx))
+    if level == 1:
+        if submode in ("Divisão exata", "Divisão com resto (só quociente)"):
+            base = 2.6
+        elif submode == "Multiplicação":
+            base = 2.1
+        elif submode in ("Misto", "Misto Desafiador"):
+            base = 2.4
         else:
-            a = random.randint(2, 99)
-            b = random.randint(2, 99)
-            if b > a:
-                a, b = b, a
-        display = f"{a} − {b}"
-        correct = a - b
-        kind = "addsub"
-        nums, ops = [a, b], ["−"]
+            base = 1.8
+        return base + 0.25 * (stage_idx - 1)
+    if level == 2:
+        base = 3.2
+        return base + 0.35 * (stage_idx - 1)
+    # Memória
+    base = 4.0
+    if n_operands is not None:
+        base += 0.35 * max(0, n_operands - 3)
+    return base + 0.35 * (stage_idx - 1)
 
-    elif op_code == "mul":
-        if hard:
-            a = random.randint(7, 25)
-            b = random.randint(7, 25)
-            if random.random() < 0.25:
-                a = -a
-            if random.random() < 0.25:
-                b = -b
+def stage_max_for(level: int, submode: str | None = None) -> int:
+    if level == 1:
+        if submode == "Soma":
+            return len(SOMA_STAGES)
+        if submode == "Subtração":
+            return len(SUB_STAGES)
+        if submode == "Multiplicação":
+            return len(MUL_STAGES)
+        if submode == "Divisão exata":
+            return len(DIV_EXACT_STAGES)
+        if submode == "Divisão com resto (só quociente)":
+            return len(DIV_QUOT_STAGES)
+        # Misto / Misto Desafiador use same cap (based on max of base ops)
+        return max(len(SOMA_STAGES), len(SUB_STAGES), len(MUL_STAGES), len(DIV_EXACT_STAGES), len(DIV_QUOT_STAGES))
+    if level == 2:
+        return len(TWO_STEPS_STAGES)
+    return len(MEMORY_STAGES)
+
+def should_advance(level: int, submode: str, stage_idx: int, n_operands: int | None = None) -> bool:
+    roll = rolling_accuracy_percent()
+    if roll is None or roll < 90.0:
+        return False
+    _, rt_med = rt_mean_median_recent(WINDOW)
+    if rt_med is None:
+        return False
+    return rt_med <= target_rt_for(level, submode, stage_idx, n_operands=n_operands)
+
+# ------------------------------------------------------------
+# Scoring
+# ------------------------------------------------------------
+def add_points(level: int, stage_idx: int, correct: bool):
+    if not correct:
+        return
+    mode_label = LEVELS[int(level)]
+    base = MODE_BASE_POINTS.get(mode_label, 10)
+    mult = SCORE_GROWTH ** max(0, int(stage_idx) - 1)
+    pts = int(round(base * mult))
+    st.session_state["score"] = int(st.session_state.get("score", 0)) + pts
+
+# ------------------------------------------------------------
+# Generators per stage
+# ------------------------------------------------------------
+def gen_add(stage_idx: int, hard: bool):
+    stage_idx = min(stage_idx, len(SOMA_STAGES))
+    a_min, a_max, b_min, b_max = SOMA_STAGES[stage_idx - 1]
+    a = random.randint(a_min, a_max)
+    b = random.randint(b_min, b_max)
+    if hard and random.random() < 0.25:
+        # allow negative b in desafiador, but display will avoid "+ -"
+        b = -b
+    display = fmt_addsub(a, b)
+    correct = a + b
+    return display, correct, "addsub", [a, b], ["+"], "add", a, b
+
+def gen_sub(stage_idx: int, hard: bool):
+    stage_idx = min(stage_idx, len(SUB_STAGES))
+    mode, lo, hi = SUB_STAGES[stage_idx - 1]
+    if mode == "nonneg":
+        a = random.randint(0, hi)
+        b = random.randint(0, hi)
+        if b > a:
+            a, b = b, a
+    else:
+        a = random.randint(lo, hi)
+        b = random.randint(lo, hi)
+    display = f"{a} − {b}"
+    correct = a - b
+    return display, correct, "addsub", [a, b], ["−"], "sub", a, b
+
+def gen_mul(stage_idx: int, hard: bool):
+    stage_idx = min(stage_idx, len(MUL_STAGES))
+    small_max, big_max, both_big = MUL_STAGES[stage_idx - 1]
+    if both_big:
+        a = random.randint(1, big_max)
+        b = random.randint(1, big_max)
+    else:
+        small = random.randint(1, small_max)
+        big = random.randint(1, big_max)
+        if random.random() < 0.5:
+            a, b = small, big
         else:
-            a = random.randint(2, 12)
-            b = random.randint(2, 12)
-        display = f"{a} × {b}"
-        correct = a * b
-        kind = "mul"
-        nums, ops = [a, b], ["×"]
+            a, b = big, small
+    if hard and random.random() < 0.20:
+        a = -a
+    if hard and random.random() < 0.20:
+        b = -b
+    display = f"{a} × {b}"
+    correct = a * b
+    return display, correct, "mul", [a, b], ["×"], "mul", a, b
 
-    elif op_code == "div_exact":
-        b = random.randint(2, 25) if hard else random.randint(2, 12)
-        q = random.randint(2, 25) if hard else random.randint(2, 12)
-        a = b * q
-        if hard and random.random() < 0.20:
-            a = -a
-        display = f"{a} ÷ {b}"
-        correct = int(a / b)
-        kind = "div_quot"
-        nums, ops = [a, b], ["÷"]
+def gen_div_exact(stage_idx: int, hard: bool):
+    stage_idx = min(stage_idx, len(DIV_EXACT_STAGES))
+    dmin, dmax, qmin, qmax = DIV_EXACT_STAGES[stage_idx - 1]
+    b = random.randint(dmin, dmax)
+    q = random.randint(qmin, qmax)
+    a = b * q
+    if hard and random.random() < 0.15:
+        a = -a
+    display = f"{a} ÷ {b}"
+    correct = int(a / b)
+    return display, correct, "div_quot", [a, b], ["÷"], "div_exact", a, b
 
-    else:  # div_quot
-        b = random.randint(2, 25) if hard else random.randint(2, 12)
-        q = random.randint(2, 40) if hard else random.randint(2, 20)
-        r = random.randint(1, b - 1)
-        a = b * q + r
-        if hard and random.random() < 0.20:
-            a = -a
-        display = f"{a} ÷ {b}"
-        correct = a // b
-        kind = "div_quot"
-        nums, ops = [a, b], ["÷"]
+def gen_div_quot(stage_idx: int, hard: bool):
+    stage_idx = min(stage_idx, len(DIV_QUOT_STAGES))
+    dmin, dmax, qmin, qmax = DIV_QUOT_STAGES[stage_idx - 1]
+    b = random.randint(dmin, dmax)
+    q = random.randint(qmin, qmax)
+    r = random.randint(1, b - 1)
+    a = b * q + r
+    if hard and random.random() < 0.15:
+        a = -a
+    display = f"{a} ÷ {b}"
+    correct = a // b
+    return display, correct, "div_quot", [a, b], ["÷"], "div_quot", a, b
 
-    prompt_key = f"{display}|{op_code}|{'H' if hard else 'N'}"
-    return display, correct, kind, nums, ops, prompt_key, op_code, a, b
-
-
-def gen_atomic(mode_key: str):
-    code = ATOMIC_MODE_TO_CODE[mode_key]
+def gen_atomic(submode_label: str, stage_idx: int):
+    code = ATOMIC_MODE_TO_CODE[submode_label]
     while True:
         if code in ("mixed", "mixed_hard"):
             hard = (code == "mixed_hard")
+            # adaptive selection of base op
             op = weighted_choice(adaptive_op_weights())
-            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(op, hard)
+            # stage for mixed uses current stage_idx (clamped per op)
+            if op == "add":
+                display, correct, kind, nums, ops, op_code, a, b = gen_add(stage_idx, hard)
+            elif op == "sub":
+                display, correct, kind, nums, ops, op_code, a, b = gen_sub(stage_idx, hard)
+            elif op == "mul":
+                display, correct, kind, nums, ops, op_code, a, b = gen_mul(stage_idx, hard)
+            elif op == "div_exact":
+                display, correct, kind, nums, ops, op_code, a, b = gen_div_exact(stage_idx, hard)
+            else:
+                display, correct, kind, nums, ops, op_code, a, b = gen_div_quot(stage_idx, hard)
+            prompt_key = f"{display}|{op}|{stage_idx}|{'H' if hard else 'N'}"
         else:
-            display, correct, kind, nums, ops, prompt_key, op_used, a, b = gen_op_problem(code, False)
+            hard = False
+            if code == "add":
+                display, correct, kind, nums, ops, op_code, a, b = gen_add(stage_idx, hard)
+            elif code == "sub":
+                display, correct, kind, nums, ops, op_code, a, b = gen_sub(stage_idx, hard)
+            elif code == "mul":
+                display, correct, kind, nums, ops, op_code, a, b = gen_mul(stage_idx, hard)
+            elif code == "div_exact":
+                display, correct, kind, nums, ops, op_code, a, b = gen_div_exact(stage_idx, hard)
+            else:
+                display, correct, kind, nums, ops, op_code, a, b = gen_div_quot(stage_idx, hard)
+            prompt_key = f"{display}|{code}|{stage_idx}"
 
         if avoid_repeat(prompt_key):
             break
@@ -371,19 +618,22 @@ def gen_atomic(mode_key: str):
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": f"Conta Simples — {mode_key}",
+        "tag": f"Conta Simples — {submode_label} — {roman(stage_idx)}",
         "kind": "inline",
         "nums": nums,
         "ops": ops,
-        "op_code": op_used,
+        "op_code": op_code,
+        "submode": submode_label,
+        "stage": stage_idx,
     }
 
-
-def gen_two_steps():
+def gen_two_steps(stage_idx: int):
+    stage_idx = min(stage_idx, len(TWO_STEPS_STAGES))
+    a_lo, a_hi, bc_lo, bc_hi = TWO_STEPS_STAGES[stage_idx - 1]
     while True:
-        a = random.randint(5, 99)
-        b = random.randint(2, 30)
-        c = random.randint(2, 30)
+        a = random.randint(a_lo, a_hi)
+        b = random.randint(bc_lo, bc_hi)
+        c = random.randint(bc_lo, bc_hi)
         op1 = random.choice(["+", "−", "×"])
         op2 = random.choice(["+", "−", "×"])
 
@@ -398,7 +648,7 @@ def gen_two_steps():
         correct = apply(first, op2, c)
         display = f"({a} {op1} {b}) {op2} {c}"
 
-        if avoid_repeat(display):
+        if avoid_repeat(display + f"|{stage_idx}"):
             break
 
     options = make_options(correct, kind="addsub")
@@ -406,25 +656,28 @@ def gen_two_steps():
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": "Conta Dupla",
+        "tag": f"Conta Dupla — {roman(stage_idx)}",
         "kind": "inline",
         "nums": [a, b, c],
         "ops": [op1, op2],
         "op_code": "two_steps",
+        "submode": "Conta Dupla",
+        "stage": stage_idx,
     }
 
-
-def gen_multiop(mode_key: str, n_operands: int):
+def gen_memory(mode_key: str, stage_idx: int):
+    stage_idx = min(stage_idx, len(MEMORY_STAGES))
+    n_operands, vmin, vmax = MEMORY_STAGES[stage_idx - 1]
     mode = MULTIOP_MODES[mode_key]
     while True:
-        nums = [random.randint(2, 20) for _ in range(n_operands)]
+        nums = [random.randint(vmin, vmax) for _ in range(n_operands)]
 
         if mode == "sum":
             ops = ["+"] * (n_operands - 1)
             correct = sum(nums)
             kind = "addsub"
         elif mode == "sub":
-            nums[0] = random.randint(30, 80)
+            nums[0] = random.randint(max(vmin, 10), max(vmax, 30))
             ops = ["−"] * (n_operands - 1)
             correct = nums[0]
             for x in nums[1:]:
@@ -436,15 +689,16 @@ def gen_multiop(mode_key: str, n_operands: int):
             for op, x in zip(ops, nums[1:]):
                 correct = (correct + x) if (op == "+") else (correct - x)
             kind = "addsub"
-        else:  # mul
-            nums = [random.randint(2, 9) for _ in range(n_operands)]
+        else:
+            # Multiplication in memory: keep numbers smaller
+            nums = [random.randint(2, min(9, vmax)) for _ in range(n_operands)]
             ops = ["×"] * (n_operands - 1)
             correct = 1
             for x in nums:
                 correct *= x
             kind = "mul"
 
-        prompt_key = f"{mode_key}:{n_operands}:{','.join(map(str, nums))}:{''.join(ops)}"
+        prompt_key = f"MEM:{mode_key}:{stage_idx}:{','.join(map(str, nums))}:{''.join(ops)}"
         if avoid_repeat(prompt_key):
             break
 
@@ -454,102 +708,77 @@ def gen_multiop(mode_key: str, n_operands: int):
         "display": display,
         "correct": correct,
         "options": options,
-        "tag": f"Memória — {mode_key}",
+        "tag": f"Memória — {mode_key} — {roman(stage_idx)}",
         "kind": "vertical",
         "nums": nums,
         "ops": ops,
         "op_code": f"mem_{mode}",
+        "submode": f"Memória — {mode_key}",
+        "stage": stage_idx,
+        "n_operands": n_operands,
     }
 
-
-def generate_problem(level: int, atomic_mode: str, multi_mode: str, n_operands: int):
+def generate_problem(level: int, atomic_mode: str, memory_mode: str):
     if level == 1:
-        return gen_atomic(atomic_mode)
+        stage = get_stage(1, "Conta Simples", atomic_mode)
+        stage = min(stage, stage_max_for(1, atomic_mode))
+        return gen_atomic(atomic_mode, stage)
     if level == 2:
-        return gen_two_steps()
-    return gen_multiop(multi_mode, n_operands)
+        stage = get_stage(2, "Conta Dupla", None)
+        stage = min(stage, stage_max_for(2, None))
+        return gen_two_steps(stage)
+    stage = get_stage(3, "Memória", "Memória")
+    stage = min(stage, stage_max_for(3, None))
+    return gen_memory(memory_mode, stage)
 
-# =========================
-# GUIDANCE
-# =========================
-def targets_text_for_context(level, atomic_mode=None, n_operands=None):
+# ------------------------------------------------------------
+# Navigation progression (requested sequence):
+# each Conta Simples submode -> Conta Dupla -> Memória
+# ------------------------------------------------------------
+def _next_stage(level: int, atomic_mode: str):
+    level = int(level)
     if level == 1:
-        if atomic_mode in ("Soma", "Subtração"):
-            return "Meta de RT: Iniciante 2,0–3,0 s | Intermediário 1,2–2,0 s | Fluência alta < 1,0 s"
-        if atomic_mode == "Multiplicação":
-            return "Meta de RT: Iniciante 2,5–4,0 s | Intermediário 1,5–2,5 s | Fluência alta < 1,2 s"
-        if atomic_mode == "Divisão exata":
-            return "Meta de RT: Iniciante 3,0–4,5 s | Intermediário 2,0–3,0 s | Fluência alta < 1,8 s"
-        if atomic_mode == "Divisão com resto (só quociente)":
-            return "Meta de RT: Iniciante 3,5–5,0 s | Intermediário 2,5–3,5 s | Fluência alta < 2,0 s"
-        if atomic_mode == "Misto Desafiador":
-            return "Meta de RT: Iniciante 3,0–5,0 s | Intermediário 2,2–3,2 s | Fluência alta < 2,0 s"
-        return "Modo misto: use as metas dos submodos como referência."
+        idx = ATOMIC_MODES.index(atomic_mode)
+        if idx < len(ATOMIC_MODES) - 1:
+            return 1, ATOMIC_MODES[idx + 1]
+        return 2, None
     if level == 2:
-        return "Meta de RT: Iniciante 4–6 s | Intermediário 3–4 s | Avançado < 3 s"
-    n = int(n_operands)
-    if n == 3:
-        return "Meta de RT: Iniciante 4–7 s | Intermediário 3–4,5 s | Avançado < 3 s"
-    if n == 4:
-        return "Meta de RT: Iniciante 6–9 s | Intermediário 4–6 s | Avançado < 4 s"
-    if n == 5:
-        return "Meta de RT: Iniciante 8–12 s | Intermediário 6–8 s | Avançado < 6 s"
-    return "Meta de RT: Iniciante 10–15 s | Intermediário 8–10 s | Avançado < 7 s"
+        return 3, None
+    return 3, None
 
-
-def recommend_progress(level, atomic_mode, n_operands):
-    hist = st.session_state["history"]
-    if not hist:
-        return "Responda algumas questões para eu recomendar com base em dados.", False
-
-    roll = rolling_accuracy_percent()
-    correct_total = sum(1 for r in hist if r["erro"] == "correto")
-    acc_total = 100.0 * correct_total / len(hist)
-    acc_used = roll if roll is not None else acc_total
-    acc_label = "acurácia rolante" if roll is not None else "acurácia total"
-
-    _, rt_med = rt_mean_median()
-    if rt_med is None:
-        return "Sem dados suficientes para recomendar.", False
-
+def _prev_stage(level: int, atomic_mode: str):
+    level = int(level)
     if level == 1:
-        thr = TARGETS_ATOMIC_INTERMEDIATE_HI.get(atomic_mode, 2.5)
-        ctx = f"Conta Simples ({atomic_mode})"
-        nxt_level, nxt_atomic = _next_stage(1, atomic_mode)
-        next_label = f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla"
-    elif level == 2:
-        thr = TARGET_TWO_STEPS_INTERMEDIATE_HI
-        ctx = "Conta Dupla"
-        next_label = "Memória"
-    else:
-        thr = TARGETS_MULTIOP_INTERMEDIATE_HI.get(int(n_operands), 6.0)
-        ctx = f"Memória ({n_operands})"
-        next_label = None
+        idx = ATOMIC_MODES.index(atomic_mode)
+        if idx > 0:
+            return 1, ATOMIC_MODES[idx - 1]
+        return 1, ATOMIC_MODES[0]
+    if level == 2:
+        return 1, ATOMIC_MODES[-1]
+    return 2, None
 
-    if acc_used < 90.0:
-        return f"Recomendação: **treine mais aqui**.\n\nMotivo: sua {acc_label} está em **{acc_used:.1f}%** (meta: ≥ 90%).", False
+def goto_prev(level: int, atomic_mode: str):
+    new_level, new_atomic = _prev_stage(level, atomic_mode)
+    st.session_state["level_choice"] = int(new_level)
+    if int(new_level) == 1 and new_atomic is not None:
+        st.session_state["atomic_mode_choice"] = new_atomic
+    st.session_state["scroll_to_challenge"] = False
+    st.session_state["current_problem"] = None
+    st.session_state["q_id"] += 1
 
-    if rt_med > thr:
-        return (
-            f"Recomendação: **treine mais aqui**.\n\n"
-            f"Motivo: sua **RT mediana** está em **{rt_med:.2f}s**, acima da meta intermediária (≤ {thr:.2f}s) "
-            f"para **{ctx}**."
-        ), False
+def goto_next(level: int, atomic_mode: str):
+    new_level, new_atomic = _next_stage(level, atomic_mode)
+    st.session_state["level_choice"] = int(new_level)
+    if int(new_level) == 1 and new_atomic is not None:
+        st.session_state["atomic_mode_choice"] = new_atomic
+    st.session_state["scroll_to_challenge"] = True
+    st.session_state["current_problem"] = None
+    st.session_state["q_id"] += 1
 
-    if next_label is None:
-        return (
-            f"Recomendação: **continue refinando**.\n\n"
-            f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s)."
-        ), True
-
-    return (
-        f"Recomendação: **pode avançar**.\n\n"
-        f"Você está com {acc_label} **{acc_used:.1f}%** e **RT mediana {rt_med:.2f}s** (meta: ≤ {thr:.2f}s). "
-        f"Agora siga para **{next_label}**."
-    ), True
-
-
-def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, current_mem_kb):
+# ------------------------------------------------------------
+# Reference + orientation
+# ------------------------------------------------------------
+def show_reference(level: int, submode_label: str, stage_idx: int, mem_kb: float, n_operands: int | None):
     st.divider()
     st.subheader("Referência e Orientação")
 
@@ -561,82 +790,114 @@ def show_reference_and_navigation(level, atomic_mode_for_path, n_operands, curre
         "- **Acurácia rolante** = porcentagem de acertos nas **últimas 10** respostas."
     )
 
-    st.markdown("### Metas de RT (neste modo)")
-    if level == 1:
-        st.write(targets_text_for_context(level, atomic_mode=atomic_mode_for_path))
-    elif level == 2:
-        st.write(targets_text_for_context(level))
-    else:
-        st.write(targets_text_for_context(level, n_operands=n_operands))
-    st.caption("Regra: velocidade só conta se a acurácia rolante estiver em **90% ou mais**.")
+    st.markdown("### Meta de RT (neste nível)")
+    target = target_rt_for(level, submode_label, stage_idx, n_operands=n_operands)
+    st.write(f"Meta intermediária neste nível: **≤ {target:.2f} s** (com acurácia rolante ≥ 90%).")
 
     st.markdown("### Carga de Memória")
-    st.write(f"**{current_mem_kb:.4f} kB**")
-    st.caption("Estimativa: bytes UTF-8 de **operandos + operadores**, convertidos para kB (1 kB = 1024 bytes).")
+    st.write(f"Estimativa: **{mem_kb:.4f} kB**")
+    st.caption("Bytes UTF-8 de **operandos + operadores**, convertidos para kB (1 kB = 1024 bytes).")
 
+def recommend_and_autoadvance(level: int, submode_label: str, stage_idx: int, n_operands: int | None):
     st.markdown("### Próximo passo")
-    rec, _ = recommend_progress(level, atomic_mode_for_path, n_operands)
-    st.info(rec)
+    max_stage = stage_max_for(level, submode_label if level == 1 else None)
+    roll = rolling_accuracy_percent()
+    _, rt_med = rt_mean_median_recent(WINDOW)
 
-    nav_left, nav_right = st.columns(2)
-    with nav_left:
-        st.button(
-            "⬅ Voltar",
-            use_container_width=True,
-            disabled=(level == 1 and atomic_mode_for_path == ATOMIC_MODES[0]),
-            on_click=goto_prev,
-            args=(level, atomic_mode_for_path),
-            key=f"nav_prev_{st.session_state['q_id']}",
-        )
-    with nav_right:
-        st.button(
-            "Avançar ➡",
-            use_container_width=True,
-            disabled=(level == 3),
-            on_click=goto_next,
-            args=(level, atomic_mode_for_path),
-            key=f"nav_next_{st.session_state['q_id']}",
-        )
+    if roll is None or rt_med is None:
+        st.info("Responda mais questões para eu recomendar com base em dados.")
+        return stage_idx
 
-# =========================
-# UI
-# =========================
+    if roll < 90.0:
+        st.info(f"Recomendação: **treinar mais aqui**. Acurácia rolante: **{roll:.1f}%** (meta: ≥ 90%).")
+        return stage_idx
+
+    target = target_rt_for(level, submode_label, stage_idx, n_operands=n_operands)
+    if rt_med > target:
+        st.info(
+            f"Recomendação: **treinar mais aqui**. RT mediana (últimas {WINDOW}): **{rt_med:.2f}s** "
+            f"(meta: ≤ {target:.2f}s)."
+        )
+        return stage_idx
+
+    if stage_idx < max_stage:
+        st.success("Você dominou este nível com tranquilidade. **Avançando automaticamente para o próximo (Roman).**")
+        new_stage = stage_idx + 1
+        if level == 1:
+            set_stage(1, "Conta Simples", new_stage, submode_label)
+        elif level == 2:
+            set_stage(2, "Conta Dupla", new_stage, None)
+        else:
+            set_stage(3, "Memória", new_stage, "Memória")
+        persist_user_state()
+        return new_stage
+
+    st.success("Você já está no último nível desta trilha. Continue refinando para ganhar consistência.")
+    return stage_idx
+
+# ============================================================
+# APP START
+# ============================================================
+login_gate()
+if st.session_state.get("logged_in"):
+    # Load user state once
+    if not st.session_state.get("_loaded_user_state", False):
+        load_user_state_into_session()
+        st.session_state["_loaded_user_state"] = True
+
 st.title(GAME_TITLE)
 
+st.metric("Pontuação", str(st.session_state.get("score", 0)))
+
+st.caption(
+    "Treine cálculo mental com respostas por clique. Você avança automaticamente dentro de cada tipo de jogo "
+    "quando mantém **acurácia rolante ≥ 90%** e **RT mediana** dentro da meta do nível."
+)
+
+# ------------------------------------------------------------
+# Menu
+# ------------------------------------------------------------
 level = st.selectbox(
     "Opção do jogo",
     list(LEVELS.keys()),
     key="level_choice",
     format_func=lambda x: f"{x} — {LEVELS[x]}",
 )
-st.caption(GAME_DESC)
 
-atomic_mode_for_path = st.session_state["atomic_mode_choice"]
-multi_mode = st.session_state["multi_mode_choice"]
-n_operands = st.session_state["n_operands_choice"]
+atomic_mode = st.session_state["atomic_mode_choice"]
+memory_mode = st.session_state["multi_mode_choice"]
 
 if int(level) == 1:
-    atomic_mode_for_path = st.selectbox(
+    atomic_mode = st.selectbox(
         "Modo (Conta Simples)",
         ATOMIC_MODES,
         key="atomic_mode_choice",
     )
 elif int(level) == 3:
-    c1, c2 = st.columns([2, 1])
-    with c1:
-        multi_mode = st.selectbox(
-            "Tipo (Memória)",list(MULTIOP_MODES.keys()),
-            key="multi_mode_choice",
-        )
-    with c2:
-        n_operands = st.selectbox(
-            "Operandos",
-            [3, 4, 5, 6],
-            key="n_operands_choice",
-        )
+    memory_mode = st.selectbox(
+        "Tipo (Memória)",
+        list(MULTIOP_MODES.keys()),
+        key="multi_mode_choice",
+    )
 
 st.divider()
 
+# show current stage for each game type (requested)
+cs_stage = get_stage(1, "Conta Simples", atomic_mode)
+cd_stage = get_stage(2, "Conta Dupla", None)
+mem_stage = get_stage(3, "Memória", "Memória")
+
+s1, s2, s3 = st.columns(3)
+with s1:
+    st.metric("Conta Simples (nível)", roman(min(cs_stage, stage_max_for(1, atomic_mode))))
+with s2:
+    st.metric("Conta Dupla (nível)", roman(min(cd_stage, stage_max_for(2, None))))
+with s3:
+    st.metric("Memória (nível)", roman(min(mem_stage, stage_max_for(3, None))))
+
+# ------------------------------------------------------------
+# Controls
+# ------------------------------------------------------------
 colA, colB = st.columns([1, 1])
 
 with colA:
@@ -648,6 +909,7 @@ with colA:
             st.rerun()
     else:
         if st.button("⏹️ Reiniciar", type="secondary"):
+            # Keep login + selections; reset gameplay
             for k in [
                 "started",
                 "current_problem",
@@ -665,6 +927,7 @@ with colA:
                 if k in st.session_state:
                     del st.session_state[k]
             init_state()
+            load_user_state_into_session()
             st.rerun()
 
 with colB:
@@ -673,16 +936,11 @@ with colB:
 if not st.session_state["started"]:
     st.stop()
 
-# =========================
-# GENERATE NEXT PROBLEM
-# =========================
+# ------------------------------------------------------------
+# Generate problem
+# ------------------------------------------------------------
 if st.session_state["current_problem"] is None:
-    st.session_state["current_problem"] = generate_problem(
-        int(level),
-        atomic_mode_for_path,
-        multi_mode,
-        int(n_operands),
-    )
+    st.session_state["current_problem"] = generate_problem(int(level), atomic_mode, memory_mode)
     st.session_state["start_time"] = time.time()
     st.session_state["q_id"] += 1
 
@@ -695,14 +953,16 @@ kind = prob["kind"]
 nums = prob["nums"]
 ops = prob["ops"]
 op_code = prob.get("op_code", "unknown")
+submode_label = prob.get("submode", "")
+stage_idx = int(prob.get("stage", 1))
+n_operands = prob.get("n_operands", None)
 
-current_mem_kb = memory_kb_for_problem(nums, ops)
+mem_kb = memory_kb_for_problem(nums, ops)
 
-# =========================
-# SCROLL ANCHOR
-# =========================
+# ------------------------------------------------------------
+# Scroll anchor (Avançar)
+# ------------------------------------------------------------
 st.markdown('<div id="challenge"></div>', unsafe_allow_html=True)
-
 if st.session_state["scroll_to_challenge"]:
     components.html(
         "<script>"
@@ -713,34 +973,25 @@ if st.session_state["scroll_to_challenge"]:
     )
     st.session_state["scroll_to_challenge"] = False
 
-# =========================
-# CHALLENGE DISPLAY
-# =========================
 st.caption(tag)
-
 if kind == "vertical":
     st.code(display)
 else:
     st.subheader(display)
 
-# =========================
-# ANSWER BUTTONS
-# =========================
+# ------------------------------------------------------------
+# Answer buttons
+# ------------------------------------------------------------
 btn_cols = st.columns(3)
 clicked_value = None
-
 for i, opt in enumerate(options):
     with btn_cols[i]:
-        if st.button(
-            str(opt),
-            key=f"opt_{st.session_state['q_id']}_{i}",
-            use_container_width=True,
-        ):
+        if st.button(str(opt), key=f"opt_{st.session_state['q_id']}_{i}", use_container_width=True):
             clicked_value = opt
 
-# =========================
-# HANDLE ANSWER
-# =========================
+# ------------------------------------------------------------
+# Handle answer
+# ------------------------------------------------------------
 if clicked_value is not None:
     rt = time.time() - st.session_state["start_time"]
     st.session_state["last_rt"] = rt
@@ -748,6 +999,9 @@ if clicked_value is not None:
     is_correct = clicked_value == correct
     err = detect_error(clicked_value, correct)
     profile_record(op_code, is_correct, err)
+
+    # scoring
+    add_points(int(level), stage_idx, is_correct)
 
     st.session_state["history"].append(
         {
@@ -761,22 +1015,38 @@ if clicked_value is not None:
     )
 
     st.session_state["rolling_correct"].append(is_correct)
-
     if len(st.session_state["rolling_correct"]) == WINDOW:
         pct = 100.0 * sum(st.session_state["rolling_correct"]) / WINDOW
         st.session_state["rolling_scores"].append(pct)
-        st.session_state["best_rolling"] = max(
-            st.session_state["best_rolling"], pct
-        )
+        st.session_state["best_rolling"] = max(st.session_state["best_rolling"], pct)
+
+    # auto-advance stage if mastered (within this selected game type)
+    if int(level) == 1:
+        current_stage = get_stage(1, "Conta Simples", atomic_mode)
+        if should_advance(1, atomic_mode, current_stage, n_operands=None):
+            new_stage = min(current_stage + 1, stage_max_for(1, atomic_mode))
+            set_stage(1, "Conta Simples", new_stage, atomic_mode)
+    elif int(level) == 2:
+        current_stage = get_stage(2, "Conta Dupla", None)
+        if should_advance(2, "Conta Dupla", current_stage, n_operands=None):
+            new_stage = min(current_stage + 1, stage_max_for(2, None))
+            set_stage(2, "Conta Dupla", new_stage, None)
+    else:
+        current_stage = get_stage(3, "Memória", "Memória")
+        if should_advance(3, "Memória", current_stage, n_operands=n_operands):
+            new_stage = min(current_stage + 1, stage_max_for(3, None))
+            set_stage(3, "Memória", new_stage, "Memória")
+
+    persist_user_state()
 
     st.session_state["current_problem"] = None
     st.rerun()
 
+# ------------------------------------------------------------
+# Stats
+# ------------------------------------------------------------
 st.divider()
 
-# =========================
-# STATISTICS
-# =========================
 hist = st.session_state["history"]
 total = len(hist)
 correct_total = sum(1 for r in hist if r["erro"] == "correto")
@@ -786,37 +1056,45 @@ m1, m2, m3, m4 = st.columns(4)
 m1.metric("Respostas", f"{total}")
 m2.metric("Acurácia total", f"{acc_total:.1f}%")
 m3.metric("Melhor rolante", f"{st.session_state['best_rolling']:.1f}%")
-m4.metric(
-    "Último tempo",
-    "—" if st.session_state["last_rt"] is None else f"{st.session_state['last_rt']:.2f}s",
-)
+m4.metric("Último tempo", "—" if st.session_state["last_rt"] is None else f"{st.session_state['last_rt']:.2f}s")
 
 if total:
     rts = [r["rt_s"] for r in hist]
-    st.caption(
-        f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s"
-    )
+    st.caption(f"RT média: {mean(rts):.2f}s | RT mediana: {median(rts):.2f}s")
 
 if len(st.session_state["rolling_correct"]) < WINDOW:
     st.info(f"Acurácia rolante aparece após {WINDOW} respostas.")
 else:
     current_pct = st.session_state["rolling_scores"][-1]
-    st.metric(
-        f"Acurácia rolante (últimas {WINDOW})",
-        f"{current_pct:.1f}%"
-    )
+    st.metric(f"Acurácia rolante (últimas {WINDOW})", f"{current_pct:.1f}%")
     st.line_chart(st.session_state["rolling_scores"])
 
 if total:
     st.subheader("Histórico recente")
     st.dataframe(hist[-20:], use_container_width=True)
 
-# =========================
-# REFERENCE + NAVIGATION
-# =========================
-show_reference_and_navigation(
-    int(level),
-    atomic_mode_for_path,
-    int(n_operands),
-    current_mem_kb,
-)
+# ------------------------------------------------------------
+# Reference + recommendation + navigation
+# ------------------------------------------------------------
+show_reference(int(level), submode_label if int(level) != 2 else "Conta Dupla", stage_idx, mem_kb, n_operands)
+stage_idx = recommend_and_autoadvance(int(level), submode_label if int(level) != 2 else "Conta Dupla", stage_idx, n_operands)
+
+nav_left, nav_right = st.columns(2)
+with nav_left:
+    st.button(
+        "⬅ Voltar",
+        use_container_width=True,
+        disabled=(int(level) == 1 and atomic_mode == ATOMIC_MODES[0]),
+        on_click=goto_prev,
+        args=(int(level), atomic_mode),
+        key=f"nav_prev_{st.session_state['q_id']}",
+    )
+with nav_right:
+    st.button(
+        "Avançar ➡",
+        use_container_width=True,
+        disabled=(int(level) == 3),
+        on_click=goto_next,
+        args=(int(level), atomic_mode),
+        key=f"nav_next_{st.session_state['q_id']}",
+    )
