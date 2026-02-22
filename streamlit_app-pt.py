@@ -2,7 +2,13 @@
 import streamlit as st
 import random
 import time
-import matplotlib.pyplot as plt
+try:
+    import matplotlib
+    matplotlib.use("Agg")
+    import matplotlib.pyplot as plt
+    MATPLOTLIB_AVAILABLE = True
+except ModuleNotFoundError:
+    MATPLOTLIB_AVAILABLE = False
 
 # ============================================================
 # MATH WIZARD — SINGLE FILE STREAMLIT APP
@@ -57,6 +63,7 @@ _init_simple("question", "")
 _init_simple("correct_result", 0)
 _init_simple("question_mode", st.session_state.mode)  # the mode this question was generated for
 _init_dict("question_start_ts", lambda _: time.time())
+_init_dict("question_level_used", lambda _: 1)
 
 # Activity time (to trigger warm-up after being away)
 _init_simple("last_active_ts", time.time())
@@ -176,6 +183,7 @@ def new_question():
     st.session_state.correct_result = ans
     st.session_state.question_mode = mode
     st.session_state.question_start_ts[mode] = time.time()
+    st.session_state.question_level_used[mode] = int(target_level)
 
 # ==============================
 # GRAPH HELPERS
@@ -434,7 +442,7 @@ if page == "Game":
                     "t": time.time(),
                     "correct": bool(correct),
                     "rt": rt,
-                    "level": int(st.session_state.current_level[mode]),
+                    "level": int(st.session_state.question_level_used.get(mode, st.session_state.current_level[mode])),
                     "score_delta": int(score_delta),
                 }
             )
@@ -521,7 +529,12 @@ if page == "Profile / Stats":
         key="graph_mode_choice"
     )
 
-    fig = plot_metric(metric_type, subtype, mode_choice)
+    if not MATPLOTLIB_AVAILABLE:
+        st.error("Matplotlib is not installed in this environment. Add it to requirements.txt to enable graphs.")
+        fig = None
+    else:
+        fig = plot_metric(metric_type, subtype, mode_choice)
+
     if fig is None:
         st.info("No measured data yet for the selected graph.")
     else:
