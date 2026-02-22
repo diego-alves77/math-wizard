@@ -8,8 +8,7 @@ from statistics import mean, median
 # CONFIG
 # =========================
 WINDOW = 10
-N_OPTIONS = 3  # fixed: exactly 3 answer buttons
-
+N_OPTIONS = 3  # exactly 3 answer buttons
 GAME_TITLE = "Mago da Matemática"
 
 LEVELS = {
@@ -18,7 +17,7 @@ LEVELS = {
     3: "Memória",
 }
 
-# Progression inside "Conta Simples"
+# Correct progression inside Conta Simples
 ATOMIC_MODES = [
     "Soma",
     "Subtração",
@@ -44,14 +43,14 @@ MULTIOP_MODES = {
     "Multiplicação": "mul",
 }
 
-# Targets (seconds) used for guidance (advance vs train more)
+# Targets (seconds): intermediate threshold for "advance"
 TARGETS_ATOMIC_INTERMEDIATE_HI = {
     "Soma": 2.0,
     "Subtração": 2.0,
     "Multiplicação": 2.5,
     "Divisão exata": 3.0,
     "Divisão com resto (só quociente)": 3.5,
-    "Mista": 2.5,  # conservative proxy
+    "Mista": 2.5,
 }
 
 TARGET_TWO_STEPS_INTERMEDIATE_HI = 4.0
@@ -77,6 +76,7 @@ def init_state():
     ss.setdefault("rolling_correct", deque(maxlen=WINDOW))
     ss.setdefault("rolling_scores", [])
     ss.setdefault("best_rolling", 0.0)
+
     ss.setdefault("last_prompt_key", None)
     ss.setdefault("last_rt", None)
     ss.setdefault("q_id", 0)
@@ -93,9 +93,8 @@ init_state()
 
 # =========================
 # NAVIGATION (callbacks)
-# Correct progression:
-# Conta Simples: each atomic mode in order -> Conta Dupla -> Memória
-# Menu selectbox still allows jumping anywhere.
+# Progression: Conta Simples (each mode) -> Conta Dupla -> Memória
+# Menu still allows jumping anywhere.
 # =========================
 def _next_stage(level: int, atomic_mode: str):
     level = int(level)
@@ -131,7 +130,6 @@ def goto_stage(direction: str, level: int, atomic_mode: str):
     if int(new_level) == 1 and new_atomic is not None:
         st.session_state["atomic_mode_choice"] = new_atomic
 
-    # reset problem so the new context generates a fresh question
     st.session_state["current_problem"] = None
     st.session_state["q_id"] += 1
 
@@ -238,11 +236,10 @@ def render_vertical_expression(nums, ops):
 # =========================
 def memory_kb_for_problem(nums, ops) -> float:
     """
-    Approximate "how much is stored in the head" as bytes of:
+    Estimate "how much is stored in the head" as bytes of tokens:
       - all operands (digits)
-      - all operators between operands
-    measured from the exact tokens (UTF-8 bytes), converted to kB.
-    1 kB = 1024 bytes.
+      - all operators between operands (includes the current operation)
+    encoded as UTF-8, converted to kB (1 kB = 1024 bytes).
     """
     tokens = [str(n) for n in nums] + [str(o) for o in ops]
     total_bytes = sum(len(t.encode("utf-8")) for t in tokens)
@@ -308,7 +305,7 @@ def gen_atomic(mode_key: str):
             display = f"{a} ÷ {b}"
             correct = a // b
             kind = "div_quot"
-            prompt_key = f"{display}|q"  # uniqueness without showing extra text
+            prompt_key = f"{display}|q"
             nums = [a, b]
             ops = ["÷"]
 
@@ -475,15 +472,11 @@ def recommend_progress(level, atomic_mode, n_operands):
     if rt_med is None:
         return "Sem dados de tempo suficientes para recomendar.", False
 
-    # threshold per context
     if level == 1:
         thr = TARGETS_ATOMIC_INTERMEDIATE_HI.get(atomic_mode, 2.5)
         ctx = f"Conta Simples ({atomic_mode})"
-        next_level, next_atomic = _next_stage(1, atomic_mode)
-        if next_level == 1:
-            next_label = f"o próximo modo (**{next_atomic}**) em Conta Simples"
-        else:
-            next_label = "Conta Dupla"
+        nxt_level, nxt_atomic = _next_stage(1, atomic_mode)
+        next_label = f"{nxt_atomic} (Conta Simples)" if nxt_level == 1 else "Conta Dupla"
     elif level == 2:
         thr = TARGET_TWO_STEPS_INTERMEDIATE_HI
         ctx = "Conta Dupla"
@@ -587,10 +580,8 @@ level = st.selectbox(
     format_func=lambda x: f"{x} — {LEVELS[x]}",
 )
 
-# Always keep a valid atomic mode for the progression path,
-# even if the user is currently in level 2 or 3.
+# Keep a valid atomic mode for the progression path, even if user is in level 2/3
 atomic_mode_for_path = st.session_state["atomic_mode_choice"]
-
 multi_mode = st.session_state["multi_mode_choice"]
 n_operands = st.session_state["n_operands_choice"]
 
@@ -600,13 +591,20 @@ if level == 1:
         ATOMIC_MODES,
         key="atomic_mode_choice",
     )
-
 elif level == 3:
     c1, c2 = st.columns([2, 1])
     with c1:
-        multi_mode = st.selectbox("Tipo (Memória)", list(MULTIOP_MODES.keys()), key="multi_mode_choice")
+        multi_mode = st.selectbox(
+            "Tipo (Memória)",
+            list(MULTIOP_MODES.keys()),
+            key="multi_mode_choice",
+        )
     with c2:
-        n_operands = st.selectbox("Operandos", [3, 4, 5, 6], key="n_operands_choice")
+        n_operands = st.selectbox(
+            "Operandos",
+            [3, 4, 5, 6],
+            key="n_operands_choice",
+        )
 
 st.divider()
 
@@ -671,4 +669,13 @@ st.caption(tag)
 if kind == "vertical":
     st.code(display)
 else:
-    st.subhea
+    st.subheader(display)
+
+# Answer buttons (3 columns)
+btn_cols = st.columns(3)
+clicked_value = None
+for i, opt in enumerate(options):
+    with btn_cols[i]:
+        if st.button(
+            str(opt),
+          
